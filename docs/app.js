@@ -75,27 +75,78 @@ function sunAlt(tSec, lat, lon) {
 }
 const isDay = (t, lat, lon) => sunAlt(t, lat, lon) > -0.833;
 
-// Windy-like wind palette (knots)
-const PAL = [[0, 98, 113, 183], [4, 57, 97, 159], [7, 74, 148, 169], [10, 77, 141, 123], [13, 83, 165, 83], [16, 53, 159, 53],
-  [19, 167, 157, 81], [22, 159, 127, 58], [25, 161, 108, 92], [29, 129, 58, 78], [33, 175, 80, 136], [38, 117, 74, 147],
-  [45, 109, 97, 163], [55, 68, 105, 141]];
-const LUT = (() => {
-  const n = 241, out = new Uint8ClampedArray(n * 3);
+// ------------------------------------------------------------------ colour scales (after Windy's)
+// stops: [value, r, g, b, alpha 0..1 (optional)] in the unit the layer shows
+const MS = 1.94384;
+const PALS = {
+  wind: [[0, 98, 113, 183], [1, 57, 97, 159], [3, 74, 148, 169], [5, 77, 141, 123], [7, 83, 165, 83], [9, 53, 159, 53], [11, 167, 157, 81],
+    [13, 159, 127, 58], [15, 161, 108, 92], [17, 129, 58, 78], [19, 175, 80, 136], [21, 117, 74, 147], [24, 109, 97, 163],
+    [27, 68, 105, 141], [29, 92, 144, 152], [36, 125, 68, 165], [46, 231, 215, 215]].map(([v, ...c]) => [v * MS, ...c]),
+  temp: [[-70, 115, 70, 105], [-55, 202, 172, 195], [-40, 162, 70, 145], [-25, 143, 89, 169], [-15, 157, 219, 217], [-8, 106, 191, 181],
+    [-4, 100, 166, 189], [0, 93, 133, 198], [1, 68, 125, 99], [10, 128, 147, 24], [21, 243, 183, 4], [30, 232, 83, 25], [47, 71, 14, 0]],
+  rain: [[0, 111, 111, 111, 0], [0.1, 60, 116, 160, 0.35], [0.6, 60, 116, 160, 0.85], [2, 59, 140, 161, 0.9], [6, 59, 161, 161], [8, 59, 161, 61],
+    [10, 130, 161, 59], [15, 161, 161, 59], [20, 161, 59, 59], [31, 161, 59, 161], [50, 168, 168, 168]],
+  cloud: [[0, 30, 30, 30, 0], [10, 90, 90, 90, 0.15], [40, 150, 150, 150, 0.45], [70, 200, 200, 200, 0.7], [100, 240, 240, 240, 0.88]],
+  pressure: [[960, 0, 32, 96], [980, 0, 52, 146], [990, 0, 90, 148], [1000, 0, 117, 146], [1010, 26, 140, 147], [1020, 103, 162, 155],
+    [1030, 155, 183, 172], [1040, 182, 182, 182], [1050, 176, 174, 152]],
+  rh: [[0, 173, 85, 56], [30, 173, 110, 56], [40, 173, 146, 56], [50, 105, 173, 56], [60, 56, 173, 121], [70, 56, 174, 173],
+    [80, 56, 157, 173], [87, 56, 135, 173], [93, 56, 123, 173], [97, 56, 98, 157], [100, 56, 70, 114]],
+  cape: [[0, 110, 110, 110, 0], [100, 87, 140, 180, 0.5], [300, 87, 140, 180], [600, 64, 200, 64], [1000, 200, 200, 50],
+    [1500, 230, 140, 30], [2500, 220, 40, 40], [3500, 200, 40, 200]],
+  vis: [[0, 175, 60, 160], [1, 190, 110, 200], [3, 130, 140, 200], [5, 90, 160, 180], [10, 90, 150, 110], [20, 70, 120, 75], [50, 55, 90, 60]],
+  current: [[0, 37, 74, 255], [0.2, 0, 100, 254], [0.4, 0, 200, 254], [0.6, 37, 193, 146], [0.8, 0, 230, 0], [1.0, 0, 250, 0],
+    [1.3, 254, 225, 0], [1.6, 254, 174, 0], [2.0, 220, 74, 28], [2.5, 180, 0, 50], [3, 254, 0, 150], [4, 151, 50, 222]],
+  waves: [[0, 159, 85, 181], [0.5, 48, 106, 182], [1, 107, 144, 212], [1.5, 107, 192, 215], [2, 114, 219, 184], [2.5, 190, 226, 128],
+    [3, 232, 220, 98], [4, 232, 170, 80], [5, 221, 110, 60], [6, 206, 60, 60], [8, 170, 40, 100], [10, 110, 20, 80]],
+  period: [[0, 80, 80, 180], [3, 70, 130, 200], [5, 80, 180, 180], [7, 100, 190, 110], [9, 200, 200, 80], [11, 230, 150, 60],
+    [14, 210, 70, 70], [18, 160, 50, 160]],
+};
+// 512-entry RGBA lookup over [lo, hi]
+function makeLut(stops, lo, hi) {
+  const n = 512, out = new Uint8ClampedArray(n * 4);
   for (let i = 0; i < n; i++) {
-    const kn = i / 4; let k = 0;
-    while (k < PAL.length - 2 && kn > PAL[k + 1][0]) k++;
-    const a = PAL[k], b = PAL[k + 1], f = Math.min(1, Math.max(0, (kn - a[0]) / (b[0] - a[0])));
-    for (let c = 0; c < 3; c++) out[i * 3 + c] = a[c + 1] + (b[c + 1] - a[c + 1]) * f;
+    const v = lo + ((hi - lo) * i) / (n - 1); let k = 0;
+    while (k < stops.length - 2 && v > stops[k + 1][0]) k++;
+    const a = stops[k], b = stops[k + 1], f = Math.min(1, Math.max(0, (v - a[0]) / (b[0] - a[0])));
+    for (let c = 1; c <= 3; c++) out[i * 4 + c - 1] = a[c] + (b[c] - a[c]) * f;
+    const aa = a[4] ?? 1, ba = b[4] ?? 1;
+    out[i * 4 + 3] = 255 * (aa + (ba - aa) * f);
   }
-  return out;
-})();
-const lutIdx = (kn) => Math.min(240, Math.max(0, Math.round(kn * 4))) * 3;
-const windColor = (kn, a = 1) => { const i = lutIdx(kn); return `rgba(${LUT[i]},${LUT[i + 1]},${LUT[i + 2]},${a})`; };
+  return { lut: out, lo, hi, k: (n - 1) / (hi - lo) };
+}
+const WIND_LUT = makeLut(PALS.wind, 0, 70);
+const lutAt = (L, v) => Math.min(511, Math.max(0, Math.round((v - L.lo) * L.k))) * 4;
+const windColor = (kn, a = 1) => { const i = lutAt(WIND_LUT, kn); return `rgba(${WIND_LUT.lut[i]},${WIND_LUT.lut[i + 1]},${WIND_LUT.lut[i + 2]},${a})`; };
+
+// map layers: topic, frame fields, value function, unit, scale, legend ticks
+const KN = KN_PER_MS;
+const LAYERS = [
+  { id: 'wind', topic: 'weather', name: 'Wind', icon: '🌬', fields: ['u10', 'v10'], val: (u, v) => Math.hypot(u, v) * KN, unit: 'kn', pal: 'wind', lo: 0, hi: 70, ticks: [0, 5, 10, 15, 20, 25, 30, 40, 50], particles: 'wind', alpha: 0.85 },
+  { id: 'gust', topic: 'weather', name: 'Gusts', icon: '💨', fields: ['gust'], val: (g) => g * KN, unit: 'kn', pal: 'wind', lo: 0, hi: 70, ticks: [0, 10, 20, 30, 40, 50, 60], particles: 'wind', alpha: 0.85 },
+  { id: 'rain', topic: 'weather', name: 'Rain', icon: '🌧', fields: ['precip'], val: (p) => p, unit: 'mm/h', pal: 'rain', lo: 0, hi: 50, ticks: [0.5, 2, 6, 10, 20, 30, 50], particles: 'wind', alpha: 1, note: 'amount in the hour before the map time' },
+  { id: 'tcc', topic: 'weather', name: 'Clouds', icon: '☁', fields: ['tcc'], val: (c) => c, unit: '%', pal: 'cloud', lo: 0, hi: 100, ticks: [0, 25, 50, 75, 100], particles: 'wind', alpha: 1 },
+  { id: 'lcc', topic: 'weather', name: 'Low clouds', icon: '🌫', fields: ['lcc'], val: (c) => c, unit: '%', pal: 'cloud', lo: 0, hi: 100, ticks: [0, 25, 50, 75, 100], particles: 'wind', alpha: 1 },
+  { id: 'mcc', topic: 'weather', name: 'Medium clouds', icon: '☁', fields: ['mcc'], val: (c) => c, unit: '%', pal: 'cloud', lo: 0, hi: 100, ticks: [0, 25, 50, 75, 100], particles: 'wind', alpha: 1 },
+  { id: 'hcc', topic: 'weather', name: 'High clouds', icon: '🌥', fields: ['hcc'], val: (c) => c, unit: '%', pal: 'cloud', lo: 0, hi: 100, ticks: [0, 25, 50, 75, 100], particles: 'wind', alpha: 1 },
+  { id: 'temp', topic: 'weather', name: 'Temperature', icon: '🌡', fields: ['t2m'], val: (t) => t, unit: '°C', pal: 'temp', lo: -25, hi: 40, ticks: [-20, -10, 0, 10, 20, 30, 40], particles: 'wind', alpha: 0.85 },
+  { id: 'dew', topic: 'weather', name: 'Dew point', icon: '💧', fields: ['td2m'], val: (t) => t, unit: '°C', pal: 'temp', lo: -25, hi: 40, ticks: [-20, -10, 0, 10, 20, 30], particles: 'wind', alpha: 0.85 },
+  { id: 'rh', topic: 'weather', name: 'Humidity', icon: '💦', fields: ['rh'], val: (h) => h, unit: '%', pal: 'rh', lo: 0, hi: 100, ticks: [20, 40, 60, 80, 100], particles: 'wind', alpha: 0.85 },
+  { id: 'pressure', topic: 'weather', name: 'Pressure', icon: '🧭', fields: ['mslp'], val: (p) => p, unit: 'hPa', pal: 'pressure', lo: 960, hi: 1050, ticks: [970, 990, 1010, 1030, 1050], particles: 'wind', alpha: 0.85 },
+  { id: 'vis', topic: 'weather', name: 'Visibility (fog)', icon: '👁', fields: ['vis'], val: (m) => m / 1000, unit: 'km', pal: 'vis', lo: 0, hi: 50, ticks: [0, 1, 5, 10, 20, 50], particles: 'wind', alpha: 0.85 },
+  { id: 'current', topic: 'current', name: 'Current', icon: '🌊', fields: ['cu', 'cv'], val: (u, v) => Math.hypot(u, v) * KN, unit: 'kn', pal: 'current', lo: 0, hi: 4, ticks: [0, 0.5, 1, 1.5, 2, 3], particles: 'current', alpha: 0.85 },
+  { id: 'hs', topic: 'waves', name: 'Waves', icon: '〰', fields: ['hs'], val: (h) => h, unit: 'm', pal: 'waves', lo: 0, hi: 10, ticks: [0, 0.5, 1, 2, 3, 4, 6], particles: null, alpha: 0.85 },
+  { id: 'swell', topic: 'waves', name: 'Swell', icon: '🌀', fields: ['swell'], val: (h) => h, unit: 'm', pal: 'waves', lo: 0, hi: 10, ticks: [0, 0.5, 1, 2, 3, 4], particles: null, alpha: 0.85 },
+  { id: 'tm', topic: 'waves', name: 'Wave period', icon: '⏱', fields: ['tm'], val: (t) => t, unit: 's', pal: 'period', lo: 0, hi: 18, ticks: [0, 3, 5, 7, 9, 12, 15], particles: null, alpha: 0.85 },
+];
+for (const L of LAYERS) L.L = makeLut(PALS[L.pal], L.lo, L.hi);
+const TOPICS = { weather: 'Weather', current: 'Current', waves: 'Waves' };
+const SRC = { weather: 'weather', current: 'current', waves: 'waves' };
 
 // ------------------------------------------------------------------ state
 const S = {
   D: null, times: [], ti: 0, playing: null,
-  ly: Object.assign({ color: true, particles: true, waves: true, swell: false, current: true }, store.get('kf.layers', {})),
+  ly: Object.assign({ layer: 'wind', particles: true, depth: false, contours: false, seamarks: false }, store.get('kf.layers2', {})),
+  LJ: null, // layers.json: grids and times of the full-resolution map frames
   base: store.get('kf.base', 'sat'),
   sel: null, // {lat, lon, spotId, ser}
   spots: [],
@@ -286,10 +337,10 @@ function evaluate(spot, ser) {
 const winText = (w) => `${tf(F.dayhm, w.t0)}–${tf(F.hm, w.t1)} · ${w.hours} h · ${fmt0(w.wmin)}–${fmt0(w.wmax)} kn ${compass(w.wd)} (gusts ${fmt0(w.gmax)}) · current up to ${fmt1(w.cs)} kn`;
 
 // ------------------------------------------------------------------ map
-const map = L.map('map', { zoomControl: true, minZoom: 7, maxZoom: 14, zoomSnap: 0.5, attributionControl: true })
+const map = L.map('map', { zoomControl: true, minZoom: 5, maxZoom: 14, zoomSnap: 0.5, attributionControl: true })
   .fitBounds(store.get('kf.view', [[51.9, 3.7], [53.5, 5.6]]));
 map.attributionControl.setPrefix('');
-for (const [n, z] of [['windColor', 250], ['windPart', 260], ['arrows', 270], ['labels', 450]]) {
+for (const [n, z] of [['dataColor', 250], ['overlay', 255], ['windPart', 260], ['labels', 450]]) {
   const p = map.createPane(n); p.style.zIndex = z; p.style.pointerEvents = 'none';
 }
 const ESRI = 'https://server.arcgisonline.com/ArcGIS/rest/services';
@@ -302,24 +353,33 @@ const BASES = {
   sea: () => [L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 18, attribution: '© OpenStreetMap contributors' })],
 };
 const BASE_NAMES = { sat: 'Satellite', dark: 'Dark map', osm: 'Street map', sea: 'Sea chart (OpenSeaMap)' };
-// OpenSeaMap sea marks (buoys, lights, fairways): drawn above the wind colours, on any background
-const seamarks = L.tileLayer('https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png', { pane: 'labels', maxZoom: 18, attribution: 'Sea marks © OpenSeaMap contributors' });
-function setSeamarks(on) { S.ly.seamarks = !!on; store.set('kf.layers', S.ly); if (on) seamarks.addTo(map); else map.removeLayer(seamarks); const el = $('lySeamarks'); if (el) el.checked = !!on; }
+// overlays above the data colours: EMODnet bathymetry (colours / depth contours) and OpenSeaMap sea marks
+const EMOD = 'https://ows.emodnet-bathymetry.eu/wms';
+const OVERLAYS = {
+  depth: { name: 'Depth (EMODnet)', title: 'Sea-floor depth, EMODnet Bathymetry', make: () => L.tileLayer.wms(EMOD, { layers: 'emodnet:mean_multicolour', format: 'image/png', transparent: true, opacity: 0.8, pane: 'overlay', attribution: 'Bathymetry © EMODnet' }) },
+  contours: { name: 'Depth contours', title: 'Depth lines, EMODnet Bathymetry', make: () => L.tileLayer.wms(EMOD, { layers: 'emodnet:contours', format: 'image/png', transparent: true, pane: 'overlay', attribution: 'Bathymetry © EMODnet' }) },
+  seamarks: { name: 'Sea marks', title: 'OpenSeaMap buoys, beacons, lights and fairways (zoom in)', make: () => L.tileLayer('https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png', { pane: 'labels', maxZoom: 18, attribution: 'Sea marks © OpenSeaMap contributors' }) },
+};
+function setOverlay(k, on) {
+  const o = OVERLAYS[k]; S.ly[k] = !!on; store.set('kf.layers2', S.ly);
+  if (on) { o.layer = o.layer || o.make(); o.layer.addTo(map); } else if (o.layer) map.removeLayer(o.layer);
+  const el = $('ov_' + k); if (el) el.checked = !!on;
+}
 let baseLayers = [];
 function setBase(k) {
   if (!BASES[k]) k = 'sat';
   baseLayers.forEach((l) => map.removeLayer(l));
   baseLayers = BASES[k]().map((l) => l.addTo(map));
-  S.base = k; store.set('kf.base', k); $('baseSel').value = k;
-  if (k === 'sea') setSeamarks(true);
+  S.base = k; store.set('kf.base', k); if ($('baseSel')) $('baseSel').value = k;
+  if (k === 'sea') setOverlay('seamarks', true);
 }
-map.attributionControl.addAttribution('Wind: KNMI HARMONIE via Open-Meteo · Waves/current: Rijkswaterstaat Matroos');
+map.attributionControl.addAttribution('Weather: KNMI HARMONIE-AROME · Waves/current: Rijkswaterstaat Matroos');
 
 function makeCanvas(pane, hiDpi) {
   const c = L.DomUtil.create('canvas', 'kf-canvas', map.getPane(pane));
   return { c, ctx: c.getContext('2d'), hiDpi, dpr: 1 };
 }
-const CV = { color: makeCanvas('windColor', false), part: makeCanvas('windPart', true), arrows: makeCanvas('arrows', true) };
+const CV = { color: makeCanvas('dataColor', false), part: makeCanvas('windPart', true) };
 function placeCanvases() {
   const sz = map.getSize(), pos = map.containerPointToLayerPoint([0, 0]);
   for (const k in CV) {
@@ -330,42 +390,111 @@ function placeCanvases() {
   }
 }
 
-// screen-space wind field (every STEP px), rebuilt on move / time change
-const STEP = 5;
-function buildField() {
-  const w = S.D && S.D.wind, t = S.times[S.ti];
-  const wi = w && w.idx.get(t);
-  const sz = map.getSize(), W = Math.ceil(sz.x / STEP) + 1, H = Math.ceil(sz.y / STEP) + 1;
-  if (wi === undefined) { S.field = null; return; }
-  const lons = new Float64Array(W), lats = new Float64Array(H);
-  for (let i = 0; i < W; i++) lons[i] = map.containerPointToLatLng([i * STEP, 0]).lng;
-  for (let j = 0; j < H; j++) lats[j] = map.containerPointToLatLng([0, j * STEP]).lat;
-  const U = new Float32Array(W * H), V = new Float32Array(W * H), Sp = new Float32Array(W * H);
-  const g = w.grid, AU = w.U[wi], AV = w.V[wi];
-  for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
-    const k = j * W + i, u = bil(g, AU, lats[j], lons[i]), v = bil(g, AV, lats[j], lons[i]);
-    U[k] = u; V[k] = v; Sp[k] = Math.hypot(u, v);
-  }
-  S.field = { W, H, U, V, Sp };
+// ---- full-resolution map frames: data/f/<field>/<time>.bin.gz = gzip(int16), row 0 = south
+const frameCache = new Map(), FRAME_MAX = 90;
+async function gunzip(buf) {
+  const b = new Uint8Array(buf);
+  if (b[0] !== 0x1f || b[1] !== 0x8b) return buf;                    // already decoded by the browser
+  return new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
 }
-function drawColor() {
+function loadFrame(field, t, scale) {
+  const key = `${field}@${t}`;
+  if (frameCache.has(key)) { const v = frameCache.get(key); frameCache.delete(key); frameCache.set(key, v); return v; }
+  const p = fetch(`data/f/${field}/${t}.bin.gz`).then((r) => { if (!r.ok) throw new Error(r.status); return r.arrayBuffer(); })
+    .then(gunzip).then((ab) => {
+      const q = new Int16Array(ab), a = new Float32Array(q.length);
+      for (let i = 0; i < q.length; i++) a[i] = q[i] === -32768 ? NaN : q[i] * scale;
+      return a;
+    }).catch(() => null);
+  frameCache.set(key, p);
+  while (frameCache.size > FRAME_MAX) frameCache.delete(frameCache.keys().next().value);
+  return p;
+}
+const layerById = (id) => LAYERS.find((l) => l.id === id) || LAYERS[0];
+const curLayer = () => layerById(S.ly.layer);
+// grid info + whether every field of a layer exists at time t
+function frameInfo(L, t) {
+  const src = S.LJ && S.LJ[SRC[L.topic]];
+  if (!src || !src.grid || !src.fields) return null;
+  for (const f of L.fields) {
+    const fi = src.fields[f]; if (!fi) return null;
+    if (!(fi.times || src.times).includes(t)) return null;
+  }
+  return src;
+}
+async function layerArrays(L, t) {
+  const src = frameInfo(L, t); if (!src) return null;
+  const arrs = await Promise.all(L.fields.map((f) => loadFrame(f, t, src.fields[f].scale)));
+  return arrs.some((a) => !a) ? null : { g: src.grid, arrs };
+}
+function preloadNext() {
+  const L = curLayer(), t = S.times[S.ti + 1];
+  if (t && frameInfo(L, t)) layerArrays(L, t);
+  const P = particleLayer(); if (P && t && frameInfo(P, t)) layerArrays(P, t);
+}
+
+// screen sampling helpers: lon per column, lat per row (Web Mercator)
+function screenAxes(step) {
+  const sz = map.getSize(), W = Math.ceil(sz.x / step) + 1, H = Math.ceil(sz.y / step) + 1;
+  const lons = new Float64Array(W), lats = new Float64Array(H);
+  for (let i = 0; i < W; i++) lons[i] = map.containerPointToLatLng([i * step, 0]).lng;
+  for (let j = 0; j < H; j++) lats[j] = map.containerPointToLatLng([0, j * step]).lat;
+  return { W, H, lons, lats };
+}
+// bilinear sample without allocation; NaN where fewer than 3 of 4 corners have data
+function sampleGrid(g, A, lat, lon) {
+  const fx = (lon - g.lon0) / g.dlon, fy = (lat - g.lat0) / g.dlat;
+  if (fx < 0 || fy < 0 || fx > g.nx - 1 || fy > g.ny - 1) return NaN;
+  return bil(g, A, lat, lon, 0.6);
+}
+
+let drawToken = 0;
+const PSTEP = 2; // colour layer resolution in screen px
+async function drawColor() {
+  const tok = ++drawToken, Ly = curLayer(), t = S.times[S.ti];
+  const data = await layerArrays(Ly, t);
+  if (tok !== drawToken) return;
   const o = CV.color, ctx = o.ctx, sz = map.getSize();
+  // pin the canvas to the current view (the map may have moved while the frame was loading)
+  if (o.c.width !== sz.x || o.c.height !== sz.y) { o.c.width = sz.x; o.c.height = sz.y; o.c.style.width = sz.x + 'px'; o.c.style.height = sz.y + 'px'; }
+  L.DomUtil.setPosition(o.c, map.containerPointToLayerPoint([0, 0]));
   ctx.clearRect(0, 0, sz.x, sz.y);
-  const f = S.field; if (!S.ly.color || !f) return;
-  const off = document.createElement('canvas'); off.width = f.W; off.height = f.H;
-  const octx = off.getContext('2d'), img = octx.createImageData(f.W, f.H), d = img.data;
-  for (let k = 0; k < f.W * f.H; k++) {
-    const s = f.Sp[k]; if (!(s === s)) continue;
-    const i = lutIdx(s); d[k * 4] = LUT[i]; d[k * 4 + 1] = LUT[i + 1]; d[k * 4 + 2] = LUT[i + 2]; d[k * 4 + 3] = 150;
+  renderLegendNote(data ? '' : (S.LJ && S.LJ[SRC[Ly.topic]] && S.LJ[SRC[Ly.topic]].error ? 'not available in this update' : 'no data at this time'));
+  if (!data) return;
+  const { g, arrs } = data, ax = screenAxes(PSTEP), lut = Ly.L.lut;
+  const off = document.createElement('canvas'); off.width = ax.W; off.height = ax.H;
+  const octx = off.getContext('2d'), img = octx.createImageData(ax.W, ax.H), d = img.data;
+  const n = arrs.length, A0 = arrs[0], A1 = arrs[1], alpha = Ly.alpha;
+  for (let j = 0; j < ax.H; j++) {
+    const lat = ax.lats[j];
+    for (let i = 0; i < ax.W; i++) {
+      const lon = ax.lons[i];
+      const a = sampleGrid(g, A0, lat, lon); if (!(a === a)) continue;
+      const v = n === 1 ? Ly.val(a) : Ly.val(a, sampleGrid(g, A1, lat, lon)); if (!(v === v)) continue;
+      const li = lutAt(Ly.L, v), k = (j * ax.W + i) * 4;
+      d[k] = lut[li]; d[k + 1] = lut[li + 1]; d[k + 2] = lut[li + 2]; d[k + 3] = lut[li + 3] * alpha;
+    }
   }
   octx.putImageData(img, 0, 0);
   ctx.imageSmoothingEnabled = true;
-  ctx.drawImage(off, 0, 0, f.W * STEP, f.H * STEP);
+  ctx.drawImage(off, 0, 0, ax.W * PSTEP, ax.H * PSTEP);
 }
 
-// particles
+// ---- particles: wind on weather layers, current on the current layer
+const particleLayer = () => { const k = curLayer().particles; return k ? layerById(k) : null; };
+const FSTEP = 6;
+async function buildField() {
+  const P = particleLayer(), t = S.times[S.ti];
+  const data = P && S.ly.particles ? await layerArrays(P, t) : null;
+  if (!data) { S.field = null; return; }
+  const { g, arrs } = data, ax = screenAxes(FSTEP), U = new Float32Array(ax.W * ax.H), V = new Float32Array(ax.W * ax.H);
+  for (let j = 0; j < ax.H; j++) for (let i = 0; i < ax.W; i++) {
+    const k = j * ax.W + i; U[k] = sampleGrid(g, arrs[0], ax.lats[j], ax.lons[i]) * KN; V[k] = sampleGrid(g, arrs[1], ax.lats[j], ax.lons[i]) * KN;
+  }
+  // speed in px per frame: wind 0.075 px per knot, current 1.4 px per knot (currents are ~15x slower)
+  S.field = { W: ax.W, H: ax.H, U, V, pk: P.id === 'current' ? 1.4 : 0.075 };
+}
 let parts = [], animId = null, moving = false;
-const PK = 0.075; // px per frame per knot
 function resetParticles() {
   const sz = map.getSize(), n = Math.round(Math.min(4500, (sz.x * sz.y) / 380));
   parts = Array.from({ length: n }, () => spawn({}, sz));
@@ -374,22 +503,24 @@ function resetParticles() {
 function spawn(p, sz) { p.x = Math.random() * sz.x; p.y = Math.random() * sz.y; p.age = Math.floor(Math.random() * 80); p.max = 60 + Math.random() * 60; return p; }
 function frame() {
   animId = requestAnimationFrame(frame);
-  if (moving || !S.ly.particles || !S.field) return;
   const o = CV.part, ctx = o.ctx, sz = map.getSize(), f = S.field;
+  if (moving) return;
+  if (!S.ly.particles || !f) { if (o.dirty) { ctx.clearRect(0, 0, sz.x, sz.y); o.dirty = false; } return; }
+  o.dirty = true;
   ctx.globalCompositeOperation = 'destination-in'; ctx.fillStyle = 'rgba(0,0,0,0.92)'; ctx.fillRect(0, 0, sz.x, sz.y);
   ctx.globalCompositeOperation = 'source-over';
   ctx.beginPath();
   for (const p of parts) {
-    const i = Math.round(p.x / STEP), j = Math.round(p.y / STEP);
+    const i = Math.round(p.x / FSTEP), j = Math.round(p.y / FSTEP);
     const k = j * f.W + i, u = f.U[k], v = f.V[k];
     if (i < 0 || j < 0 || i >= f.W || j >= f.H || !(u === u) || ++p.age > p.max) { spawn(p, sz); p.age = 0; continue; }
-    const nx = p.x + u * PK, ny = p.y - v * PK;
+    const nx = p.x + u * f.pk, ny = p.y - v * f.pk;
     ctx.moveTo(p.x, p.y); ctx.lineTo(nx, ny); p.x = nx; p.y = ny;
   }
   ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = 1.1; ctx.stroke();
 }
 
-// wave / swell / current arrows
+// small arrow (used by the chart)
 function arrow(ctx, x, y, bearing, len, color, width) {
   const a = bearing * RAD, dx = Math.sin(a), dy = -Math.cos(a);
   const x0 = x - (dx * len) / 2, y0 = y - (dy * len) / 2, x1 = x + (dx * len) / 2, y1 = y + (dy * len) / 2;
@@ -398,146 +529,70 @@ function arrow(ctx, x, y, bearing, len, color, width) {
   path(); ctx.strokeStyle = 'rgba(0,0,0,0.55)'; ctx.lineWidth = width + 2.2; ctx.stroke();
   path(); ctx.strokeStyle = color; ctx.lineWidth = width; ctx.stroke();
 }
-// example run from the beach, all at 10 kn through the water, with the current at the spot added to every leg:
-//  1. out: 1 km at 70° off the wind, on the seaward tack
-//  2. back: at 60° off the wind until 100 m off the beach
-//  3. downwind: along the beach, back to the line through the start square to the coast.
-// The length of 3 is the upwind ground gained; it is compared with the same run in still water.
-const KITE_KN = 10, OUT_M = 1000, OUT_ANG = 70, BACK_ANG = 60, SHORE_M = 100, MS_PER_KN = 0.514444, SCORE_M = 200;
-function simTrack(spot, wd, cs, cd) {
-  const V = KITE_KN * MS_PER_KN, vec = (b, m) => [m * Math.sin(b * RAD), m * Math.cos(b * RAD)];
-  const dot = (a, b) => a[0] * b[0] + a[1] * b[1];
-  const f = vec(spot.facing, 1);                                             // seaward unit vector
-  const pick = (a, b, sea) => ((dot(vec(a, 1), f) >= dot(vec(b, 1), f)) === sea ? a : b);
-  const h1 = pick(norm360(wd + OUT_ANG), norm360(wd - OUT_ANG), true);      // tack that goes out
-  const h2 = pick(norm360(wd + BACK_ANG), norm360(wd - BACK_ANG), false);   // tack that comes back
-  const c = vec(cd, cs * MS_PER_KN);
-  const t1 = OUT_M / V, g1 = vec(h1, V); g1[0] += c[0]; g1[1] += c[1];
-  const P1 = [g1[0] * t1, g1[1] * t1];
-  const g2 = vec(h2, V); g2[0] += c[0]; g2[1] += c[1];
-  const off1 = dot(P1, f), in2 = -dot(g2, f);                               // m off the beach, approach speed
-  if (off1 <= SHORE_M || in2 <= 0.05) return { h1, h2, P1, fail: off1 <= SHORE_M ? 'the current keeps you on the beach' : 'you cannot get back on this tack' };
-  const t2 = (off1 - SHORE_M) / in2, P2 = [P1[0] + g2[0] * t2, P1[1] + g2[1] * t2];
-  // along the beach, the "upwind" way
-  let up = [-f[1], f[0]]; const wTo = vec(wd + 180, 1); if (dot(up, wTo) > 0) up = [-up[0], -up[1]];
-  const gain = dot(P2, up), P3 = [P2[0] - up[0] * gain, P2[1] - up[1] * gain];
-  return { h1, h2, P1, P2, P3, gain, secs: t1 + t2, t1, t2 };
-}
-function kiteTrack(spot, r) {
-  if (!r || !Number.isFinite(r.wd)) return null;
-  const noCur = !Number.isFinite(r.cs);
-  const k = simTrack(spot, r.wd, noCur ? 0 : r.cs, noCur ? 0 : r.cd);
-  const still = simTrack(spot, r.wd, 0, 0);
-  k.still = still.fail ? null : still.gain; k.noCur = noCur; k.cs = r.cs; k.cd = r.cd; k.wd = r.wd;
-  k.help = k.fail || k.still == null ? null : k.gain - k.still;               // metres the current adds (+) or costs (−)
-  return k;
-}
-// red (current runs with the wind) → yellow (like still water) → green (current carries you upwind)
-function scoreColor(help) {
-  if (help == null) return '#ef4444';
-  const x = Math.max(-1, Math.min(1, help / SCORE_M));
-  const mix = (a, b, t) => '#' + [0, 2, 4].map((i) => Math.round(parseInt(a.substr(i, 2), 16) * (1 - t) + parseInt(b.substr(i, 2), 16) * t).toString(16).padStart(2, '0')).join('');
-  return x < 0 ? mix('facc15', 'ef4444', -x) : mix('facc15', '22c55e', x);
-}
-const trackText = (k) => k.fail ? `No downwind run: ${k.fail}.` :
-  `Downwind run ${Math.round(k.gain)} m (still water ${k.still == null ? '–' : Math.round(k.still)} m), ` +
-  (k.noCur ? 'no current data.' : `current ${k.help >= 0 ? 'adds' : 'costs'} ${Math.abs(Math.round(k.help))} m.`);
 
-function drawArrows() {
-  const o = CV.arrows, ctx = o.ctx, sz = map.getSize();
-  ctx.clearRect(0, 0, sz.x, sz.y);
-  const D = S.D; if (!D || !S.spotSer) return;
-  ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.font = '600 10px -apple-system, sans-serif';
-  const text = (s, x, y, col, align = 'center') => { ctx.textAlign = align; ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(0,0,0,.75)'; ctx.strokeText(s, x, y); ctx.fillStyle = col; ctx.fillText(s, x, y); };
-  // sailing layer: current arrows over the Wadden Sea from the fine grid
-  const W = S.W, fi = W && W.idx.get(S.times[S.ti]);
-  if (S.ly.wadden && W && fi !== undefined) {
-    // zoomed in: one arrow per ~3 cm of screen (113 CSS px); zoomed out a denser grid so the area isn't empty
-    const z = map.getZoom(), sp = z >= 11 ? 113 : z >= 10 ? 70 : 46, len = z >= 11 ? 1.6 : 1;
-    const g = W.grid, lab = z >= 11;
-    const a = map.latLngToContainerPoint([g.lat0 + (g.ny - 1) * g.dlat, g.lon0]), b = map.latLngToContainerPoint([g.lat0, g.lon0 + (g.nx - 1) * g.dlon]);
-    for (let y = Math.max(sp / 2, a.y + sp / 2); y < Math.min(sz.y, b.y); y += sp) for (let x = Math.max(sp / 2, a.x + sp / 2); x < Math.min(sz.x, b.x); x += sp) {
-      const ll = map.containerPointToLatLng([x, y]);
-      const u = bil(g, W.U[fi], ll.lat, ll.lng, 0.75), v = bil(g, W.V[fi], ll.lat, ll.lng, 0.75), s = Math.hypot(u, v);
-      if (!(s > 0.05)) continue;
-      arrow(ctx, x, y, bearingOf(u, v), (10 + 12 * Math.min(s, 2.5)) * len, '#22d3ee', z >= 11 ? 2 : 1.5);
-      if (lab) text(`${s.toFixed(1)} kn`, x, y + 18, '#67e8f9');
-    }
-  }
-  for (const spot of S.spots) {
-    const ser = S.spotSer.get(spot.id), r = ser && ser.rows[S.ti]; if (!r) continue;
-    const p = map.latLngToContainerPoint([spot.lat, spot.lon]);
-    if (p.x < -200 || p.y < -200 || p.x > sz.x + 200 || p.y > sz.y + 200) continue;
-    // ---- example run (true scale when zoomed in, enlarged otherwise; the labels give the real metres)
-    const k = kiteTrack(spot, r);
-    if (k) {
-      const q = map.latLngToContainerPoint([spot.lat + 1000 / 110570, spot.lon]);
-      const sc = Math.max((p.y - q.y) / 1000, 110 / 1000);                    // px per metre
-      const P = (m) => [p.x + m[0] * sc, p.y - m[1] * sc];
-      const line = (pts, col, w, dash) => {
-        ctx.setLineDash(dash || []); ctx.beginPath(); pts.forEach((m, i) => (i ? ctx.lineTo : ctx.moveTo).call(ctx, ...P(m)));
-        ctx.strokeStyle = 'rgba(0,0,0,.6)'; ctx.lineWidth = w + 2; ctx.stroke(); ctx.strokeStyle = col; ctx.lineWidth = w; ctx.stroke(); ctx.setLineDash([]);
-      };
-      const col = scoreColor(k.help);
-      if (k.fail) line([[0, 0], k.P1], '#fff', 1.6, [5, 4]);
-      else {
-        line([[0, 0], k.P1, k.P2], '#fff', 1.6, [5, 4]);
-        line([k.P2, k.P3], col, 4);
-        const A = P(k.P2), B = P(k.P3);
-        if (Math.hypot(B[0] - A[0], B[1] - A[1]) > 10) arrow(ctx, (A[0] + B[0]) / 2, (A[1] + B[1]) / 2, bearingOf(B[0] - A[0], A[1] - B[1]), 12, col, 2.5);
-        for (const m of [k.P1, k.P2]) { const [x, y] = P(m); ctx.beginPath(); ctx.arc(x, y, 3, 0, 2 * Math.PI); ctx.fillStyle = '#fff'; ctx.fill(); }
-      }
-      if (map.getZoom() >= 10) {
-        const E = P(k.fail ? k.P1 : k.P2), left = E[0] < p.x, tx = E[0] + (left ? -8 : 8), al = left ? 'right' : 'left';
-        if (k.fail) text('no downwind run', tx, E[1], '#fca5a5', al);
-        else {
-          text(`downwind ${Math.round(k.gain)} m`, tx, E[1] - 4, col, al);
-          text(k.noCur ? 'no current data' : `current ${k.help >= 0 ? '+' : '−'}${Math.abs(Math.round(k.help))} m`, tx, E[1] + 9, '#a5f3fc', al);
-        }
-      }
-    }
-    // ---- wave and current at the spot (from the nearest sea point), beside the pin
-    if ((S.ly.waves || S.ly.swell) && Number.isFinite(r.hs)) {
-      const hs = S.ly.swell ? r.sw : r.hs, col = S.ly.swell ? '#c4b5fd' : '#ffffff';
-      if (Number.isFinite(hs)) {
-        arrow(ctx, p.x + 32, p.y - 12, r.vd + 180, 10 + 8 * Math.min(hs, 3), col, 1.3 + Math.min(hs, 3) * 0.6);
-        text(`${hs.toFixed(1)} m`, p.x + 48, p.y - 9, col, 'left');
-      }
-    }
-    if (S.ly.current && Number.isFinite(r.cs)) {
-      arrow(ctx, p.x + 32, p.y + 16, r.cd, 8 + 10 * Math.min(r.cs, 2.5), '#22d3ee', 1.8);
-      text(`${r.cs.toFixed(1)} kn`, p.x + 48, p.y + 19, '#67e8f9', 'left');
-    }
-  }
-}
-
-function redrawMap() { if (!S.D) return; buildField(); drawColor(); drawArrows(); }
+async function redrawMap() { if (!S.D && !S.LJ) return; drawColor(); await buildField(); preloadNext(); }
 map.on('movestart zoomstart', () => {
   moving = true; CV.part.ctx.clearRect(0, 0, CV.part.c.width, CV.part.c.height);
 });
-map.on('zoomstart', () => { CV.color.c.style.opacity = 0; CV.arrows.c.style.opacity = 0; });
+map.on('zoomstart', () => { CV.color.c.style.opacity = 0; });
 map.on('moveend', () => {
   placeCanvases(); redrawMap(); resetParticles(); moving = false;
-  CV.color.c.style.opacity = 1; CV.arrows.c.style.opacity = 1;
+  CV.color.c.style.opacity = 1;
   const b = map.getBounds(); store.set('kf.view', [[b.getSouth(), b.getWest()], [b.getNorth(), b.getEast()]]);
 });
 map.on('resize', () => { placeCanvases(); redrawMap(); resetParticles(); });
-// keep colours and arrows under the finger while dragging (throttled; skipped during zoom animations)
+// keep colours under the finger while dragging (throttled; skipped during zoom animations)
 let zooming = false, lastLive = 0;
 map.on('zoomstart', () => { zooming = true; });
 map.on('zoomend', () => { zooming = false; });
 map.on('move', () => {
   const now = performance.now();
-  if (zooming || now - lastLive < 120 || !S.D) return;
-  lastLive = now; placeCanvases(); redrawMap();
+  if (zooming || now - lastLive < 120 || !S.LJ) return;
+  lastLive = now; placeCanvases(); drawColor();
 });
+
+// ---- layer menu (Windy-style: topic tabs, layer list, overlays, background)
+function renderMenu() {
+  const L = curLayer(), box = $('layers');
+  const avail = (l) => { const src = S.LJ && S.LJ[SRC[l.topic]]; return !!(src && src.fields && l.fields.every((f) => src.fields[f])); };
+  box.innerHTML = `<div class="tabs">${Object.entries(TOPICS).map(([k, n]) => `<button class="tab ${L.topic === k ? 'on' : ''}" data-topic="${k}">${n}</button>`).join('')}</div>
+    <div class="lylist">${LAYERS.filter((l) => l.topic === L.topic).map((l) => `<button class="ly ${l.id === L.id ? 'on' : ''}" data-ly="${l.id}" ${avail(l) ? '' : 'disabled title="Not in this update"'}><span>${l.icon}</span>${l.name}</button>`).join('')}</div>
+    <div class="card-title">Overlays</div>
+    <label><input type="checkbox" id="ov_particles" ${S.ly.particles ? 'checked' : ''}> Moving ${L.particles === 'current' ? 'current' : 'wind'} particles</label>
+    ${Object.entries(OVERLAYS).map(([k, o]) => `<label title="${o.title}"><input type="checkbox" id="ov_${k}" ${S.ly[k] ? 'checked' : ''}> ${o.name}</label>`).join('')}
+    <div class="card-title">Background</div>
+    <select id="baseSel">${Object.entries(BASE_NAMES).map(([k, n]) => `<option value="${k}" ${S.base === k ? 'selected' : ''}>${n}</option>`).join('')}</select>`;
+  box.querySelectorAll('[data-topic]').forEach((b) => b.onclick = () => { const l = LAYERS.find((x) => x.topic === b.dataset.topic && avail(x)) || LAYERS.find((x) => x.topic === b.dataset.topic); selectLayer(l.id); });
+  box.querySelectorAll('[data-ly]').forEach((b) => b.onclick = () => selectLayer(b.dataset.ly));
+  $('ov_particles').onchange = (e) => { S.ly.particles = e.target.checked; store.set('kf.layers2', S.ly); redrawMap(); };
+  for (const k of Object.keys(OVERLAYS)) $('ov_' + k).onchange = (e) => setOverlay(k, e.target.checked);
+  $('baseSel').onchange = (e) => setBase(e.target.value);
+}
+function selectLayer(id) {
+  S.ly.layer = id; store.set('kf.layers2', S.ly);
+  renderMenu(); drawLegend(); resetParticles(); redrawMap();
+}
 
 // hover readout
 map.on('mousemove', (e) => { if (S.D) showReadout(e.latlng.lat, e.latlng.lng); });
 map.on('mouseout', () => $('readout').classList.add('hidden'));
 function showReadout(lat, lon) {
-  const r = sampleAt(lat, lon, S.times[S.ti]);
+  const r = S.D ? sampleAt(lat, lon, S.times[S.ti]) : {};
   const parts2 = [`<span class="muted">${lat.toFixed(3)}° N ${lon.toFixed(3)}° E</span>`];
+  const L = curLayer(), t = S.times[S.ti], src = frameInfo(L, t);
+  if (src) {
+    const ks = L.fields.map((f) => frameCache.get(`${f}@${t}`));
+    Promise.all(ks).then((arrs) => {
+      if (arrs.some((a) => !a) || !$('roLayer')) return;
+      const vals = arrs.map((a) => sampleGrid(src.grid, a, lat, lon)), v = L.val(...vals);
+      if (Number.isFinite(v)) {
+        const li = lutAt(L.L, v), c = L.L.lut;
+        $('roLayer').innerHTML = `<b style="color:rgb(${c[li]},${c[li + 1]},${c[li + 2]})">■</b> ${L.name} <b>${v < 10 && L.unit !== '%' ? v.toFixed(1) : Math.round(v)} ${L.unit}</b>` +
+          (L.fields.length === 2 ? ` toward ${compass(bearingOf(vals[0], vals[1]))}` : '');
+      } else $('roLayer').textContent = `${L.name}: no data here`;
+    });
+    parts2.push('<span id="roLayer"></span>');
+  }
   if (Number.isFinite(r.ws)) parts2.push(`<b style="color:${windColor(r.ws)}">■</b> Wind <b>${fmt0(r.ws)} kn</b> from ${compass(r.wd)} · gusts ${fmt0(r.gust)} kn`);
   if (Number.isFinite(r.hs)) parts2.push(`Waves <b>${fmt1(r.hs)} m</b> ${fmt1(r.tm)} s from ${compass(r.vd)} · swell ${fmt1(r.sw)} m`);
   if (Number.isFinite(r.cs)) parts2.push(`Current <b>${fmt1(r.cs)} kn</b> toward ${compass(r.cd)}`);
@@ -587,7 +642,8 @@ function renderStatus() {
   };
   const gen = ts(D.generated), nxt = ts(D.next_update), ageH = (Date.now() / 1000 - gen) / 3600;
   $('status').innerHTML = [
-    run('wind', 'Wind HARMONIE'), run('waves', 'Waves SWAN'), run('current', 'Current DCSM'),
+    S.LJ && S.LJ.weather && S.LJ.weather.run ? `<span class="chip">HARMONIE: <b>${tf(F.dayhm, ts(S.LJ.weather.run))}</b> run${S.LJ.weather.stale ? ' <span class="warn">(old: update failed)</span>' : ''}</span>` : run('wind', 'Wind HARMONIE'),
+    run('waves', 'Waves SWAN'), run('current', 'Current DCSM'),
     `<span class="chip ${ageH > 26 ? 'warn' : 'fresh'}">Data fetched <b>${rel(gen)}</b></span>`,
     `<span class="chip">Next update <b>${tf(F.dayhm, nxt)}</b> (${rel(nxt)})</span>`,
   ].join('');
@@ -816,7 +872,7 @@ function renderSpotCfg() {
     <p class="muted small">Side-shore = wind roughly parallel to the beach. The margins say how far the wind may turn toward the sea (side-onshore) or toward the land (side-offshore). Offshore wind never passes with the side-offshore margin at 0. “Against the wind” means the current flows toward where the wind comes from, within the tolerance.</p>
     <button class="btn small danger" id="cfDelete">Delete spot</button></div>
     <div class="wins" id="cfWins"></div>`;
-  const upd = () => { saveSpots(); drawChart(); drawCompass(); renderWins(); renderSpots(); drawArrows(); };
+  const upd = () => { saveSpots(); drawChart(); drawCompass(); renderWins(); renderSpots(); };
   box.querySelectorAll('[data-k]').forEach((inp) => inp.addEventListener('change', () => {
     const k = inp.dataset.k;
     th[k] = inp.type === 'checkbox' ? inp.checked : (inp.value === '' ? '' : +inp.value);
@@ -827,7 +883,7 @@ function renderSpotCfg() {
   $('cfName').addEventListener('change', (e) => { spot.name = e.target.value || spot.name; $('pTitle').textContent = spot.name; upd(); });
   $('cfDelete').addEventListener('click', () => {
     if (!confirm(`Delete spot “${spot.name}”?`)) return;
-    S.spots = S.spots.filter((s) => s !== spot); saveSpots(); renderSpots(); drawArrows(); closePanel('point');
+    S.spots = S.spots.filter((s) => s !== spot); saveSpots(); renderSpots(); closePanel('point');
   });
   drawCompass(); renderWins();
 }
@@ -835,12 +891,7 @@ function renderWins() {
   const el = $('cfWins'); if (!el || !S.sel) return;
   const spot = S.spots.find((s) => s.id === S.sel.spotId); if (!spot) return;
   const ev = evaluate(spot, S.sel.ser);
-  const k = kiteTrack(spot, S.sel.ser.rows[S.ti]);
-  const tack = k ? `<p class="small" style="margin:0 0 8px"><b>Example run</b> <span class="muted">(${tf(F.dayhm, S.times[S.ti])}, all legs at ${KITE_KN} kn)</span><br>` +
-    `Out ${OUT_M} m toward ${compass(k.h1)} (${OUT_ANG}° off the wind), back toward ${compass(k.h2)} (${BACK_ANG}° off the wind) until ${SHORE_M} m off the beach, ` +
-    `then downwind along the beach to where you started. Current ${k.noCur ? 'unknown' : `${fmt1(k.cs)} kn toward ${compass(k.cd)}`}.<br>` +
-    `<b style="color:${scoreColor(k.help)}">■</b> ${trackText(k)} <span class="muted">Red = the current costs ${SCORE_M} m or more, yellow = like still water, green = it gains ${SCORE_M} m or more.</span></p>` : '';
-  el.innerHTML = tack + '<b>Kite windows</b>' + (ev.wins.length ? ev.wins.map((w) => `<div class="win">✓ ${winText(w)}</div>`).join('') : '<div class="win none">None in this forecast. Hover the chart to see which condition fails each hour.</div>');
+  el.innerHTML = '<b>Kite windows</b>' + (ev.wins.length ? ev.wins.map((w) => `<div class="win">✓ ${winText(w)}</div>`).join('') : '<div class="win none">None in this forecast. Hover the chart to see which condition fails each hour.</div>');
 }
 function drawCompass() {
   const el = $('compassSvg'); if (!el || !S.sel) return;
@@ -873,9 +924,18 @@ function drawCompass() {
 
 // ------------------------------------------------------------------ legend
 function drawLegend() {
-  const c = $('legendCanvas'), ctx = c.getContext('2d'), max = 45;
-  for (let x = 0; x < c.width; x++) { ctx.fillStyle = windColor((x / c.width) * max); ctx.fillRect(x, 0, 1, c.height); }
-  $('legendLabels').innerHTML = [0, 5, 10, 15, 20, 25, 30, 35, 40].map((v) => `<span style="left:${(v / max) * 100}%">${v}</span>`).join('');
+  const L = curLayer(), c = $('legendCanvas'), ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+  for (let x = 0; x < c.width; x++) {
+    const v = L.lo + ((L.hi - L.lo) * x) / c.width, i = lutAt(L.L, v), u = L.L.lut;
+    ctx.fillStyle = `rgba(${u[i]},${u[i + 1]},${u[i + 2]},${Math.max(0.25, u[i + 3] / 255)})`; ctx.fillRect(x, 0, 1, c.height);
+  }
+  $('legendLabels').innerHTML = L.ticks.map((v) => `<span style="left:${((v - L.lo) / (L.hi - L.lo)) * 100}%">${v}</span>`).join('');
+  renderLegendNote('');
+}
+function renderLegendNote(note) {
+  const L = curLayer();
+  document.querySelector('#legend .legend-unit').innerHTML = `${esc(L.name)}, ${esc(L.unit)}${L.note ? ` · <span class="muted">${esc(L.note)}</span>` : ''}${note ? ` · <span class="warn">${esc(note)}</span>` : ''}`;
 }
 
 // ------------------------------------------------------------------ forced update via GitHub Actions
@@ -961,16 +1021,27 @@ async function loadWadden() {
     c.idx = new Map(c.times.map((t, i) => [t, i]));
     c.U = toFrames(c.u, 0.01 * KN_PER_MS); c.V = toFrames(c.v, 0.01 * KN_PER_MS); delete c.u; delete c.v;
     S.W = c;
-    renderSpots(); drawArrows();
+    renderSpots();
     if (S.sel) openPoint(S.sel.lat, S.sel.lon, S.sel.spotId);
   } catch { /* optional file */ }
 }
 async function fetchData() {
   try { const r = await fetch(`data/forecast.json?v=${Date.now()}`, { cache: 'no-store' }); if (!r.ok) return null; return await r.json(); } catch { return null; }
 }
-function applyData(D) {
+async function fetchLayers() {
+  try { const r = await fetch(`data/layers.json?v=${Date.now()}`, { cache: 'no-store' }); if (!r.ok) return null; return await r.json(); } catch { return null; }
+}
+async function applyData(D) {
   const keepT = S.times[S.ti];
-  S.D = D; S.times = prepare(D);
+  S.LJ = await fetchLayers();
+  frameCache.clear();
+  S.D = D;
+  // one hourly time axis over the point data and every map layer
+  const all = [...prepare(D)];
+  for (const k of ['weather', 'current', 'waves']) { const src = S.LJ && S.LJ[k]; if (src && src.times) all.push(...src.times); }
+  const t0 = Math.min(...all), t1 = Math.max(...all); S.times = [];
+  for (let t = t0; t <= t1; t += 3600) S.times.push(t);
+  renderMenu(); drawLegend();
   let i = S.times.indexOf(keepT);
   if (i < 0) { const now = Date.now() / 1000; i = S.times.findIndex((t) => t + 1800 >= now); if (i < 0) i = S.times.length - 1; }
   buildTimebar(); renderStatus();
@@ -982,32 +1053,9 @@ function applyData(D) {
   loadWadden();
 }
 async function boot() {
-  for (const [id, k] of [['lyColor', 'color'], ['lyParticles', 'particles'], ['lyWaves', 'waves'], ['lySwell', 'swell'], ['lyCurrent', 'current']]) {
-    const el = $(id); el.checked = !!S.ly[k];
-    el.addEventListener('change', () => {
-      S.ly[k] = el.checked;
-      if (k === 'swell' && el.checked) { S.ly.waves = false; $('lyWaves').checked = false; }
-      if (k === 'waves' && el.checked) { S.ly.swell = false; $('lySwell').checked = false; }
-      store.set('kf.layers', S.ly);
-      if (k === 'particles' && !el.checked) CV.part.ctx.clearRect(0, 0, CV.part.c.width, CV.part.c.height);
-      drawColor(); drawArrows();
-    });
-  }
-  // background choices and the sea-marks switch are added here, so index.html needs no change
-  const sel = $('baseSel'); sel.innerHTML = Object.entries(BASE_NAMES).map(([k, n]) => `<option value="${k}">${n}</option>`).join(''); sel.value = S.base;
-  const lab = document.createElement('label');
-  lab.innerHTML = '<input type="checkbox" id="lySeamarks"> ⚓ Sea marks';
-  lab.title = 'OpenSeaMap buoys, beacons, lights and fairways (zoom in to see them)';
-  sel.after(lab);
-  const wl = document.createElement('label');
-  wl.innerHTML = '<input type="checkbox" id="lyWadden"> <span class="sw cur"></span>Wadden current';
-  wl.title = 'Current arrows over the Wadden Sea on a ~670 m grid (sailing). Zoom in for the numbers (knots).';
-  $('lyCurrent').parentElement.after(wl);
-  $('lyWadden').checked = !!S.ly.wadden;
-  $('lyWadden').addEventListener('change', (e) => { S.ly.wadden = e.target.checked; store.set('kf.layers', S.ly); drawArrows(); });
-  $('lySeamarks').addEventListener('change', (e) => setSeamarks(e.target.checked));
-  setSeamarks(S.ly.seamarks); setBase(S.base);
-  sel.addEventListener('change', (e) => setBase(e.target.value));
+  for (const k of Object.keys(OVERLAYS)) if (S.ly[k]) setOverlay(k, true);
+  setBase(S.base);
+  renderMenu();
   drawLegend(); placeCanvases(); frame();
   const D = await fetchData();
   if (!D) { $('status').innerHTML = '<span class="warn">No forecast data yet. The first GitHub update has not run, or it failed.</span>'; return; }
