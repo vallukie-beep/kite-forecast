@@ -2,20 +2,33 @@
 """Download the kite forecast data and write one compact JSON file for the web page.
 
 Sources
-- Wind:    KNMI HARMONIE-AROME (2 km), via the Open-Meteo API (model knmi_harmonie_arome_netherlands).
+- Weather: KNMI HARMONIE-AROME Cy43 P1 (2.5 km, whole model area), from the KNMI Data Platform.
+           Needs a free API key in the environment variable KNMI_API_KEY (a GitHub secret).
+           Without it, the spot/chart wind falls back to HARMONIE via Open-Meteo and the
+           weather map layers are not produced.
 - Waves:   Rijkswaterstaat SWAN Kuststrook (HARMONIE-forced), via Matroos (noos.matroos.rws.nl).
 - Current: Rijkswaterstaat DCSM7/ZUNO (HARMONIE-forced, bias-filtered), via Matroos.
 
-Usage:  python3 fetch_data.py --out docs/data [--previous old_forecast.json]
-A source that fails keeps the data from --previous (if given) so the page never goes blank.
-Depends only on requests + numpy (nc3.py is a small netCDF-3 reader).
+Output (in --out):
+- forecast.json   point data for the spot checks and the click graph (coastal area)
+- wadden.json     fine current grid for the Wadden Sea (graphs)
+- layers.json     list of map layers, grids and times
+- f/<field>/<unix time>.bin.gz   one map frame: gzip of int16 values (row 0 = south),
+                  value = int * scale, -32768 = no data
+
+Usage:  python3 fetch_data.py --out docs/data [--previous old_forecast.json] [--previous-site URL]
+A source that fails keeps the data from the previous run, so the page never goes blank.
+Depends only on requests + numpy (nc3.py reads netCDF-3, grib1.py reads GRIB1).
 """
 import argparse
 import datetime as dt
+import gzip
+import io
 import json
 import math
 import os
 import sys
+import tarfile
 import time
 
 import numpy as np
@@ -23,6 +36,7 @@ import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from nc3 import NC3  # noqa: E402
+from grib1 import messages  # noqa: E402
 
 # ---------------------------------------------------------------- CONFIG
 BBOX = dict(lon0=3.5, lon1=5.7, lat0=51.8, lat1=53.6)       # Hoek van Holland .. Terschelling
@@ -38,7 +52,33 @@ CURRENT_FIELDS = ["VELU", "VELV"]
 WADDEN_BBOX = dict(lon0=4.65, lon1=5.70, lat0=52.90, lat1=53.45)
 WADDEN_N = (106, 92)                                          # 0.01° lon x 0.006° lat
 HORIZON_H = 72
+WEATHER_H = 60          # HARMONIE P1 goes to +60 h
+
+# Full-resolution map frames
+KNMI_API = "https://api.dataplatform.knmi.nl/open-data/v1/datasets/harmonie_arome_cy43_p1/versions/1.0"
+# Matroos regridded close to the native model resolution (SWAN ~300-450 m, ZUNO ~500-900 m near the coast)
+MARINE_BOX = dict(lon0=2.5, lon1=7.3, lat0=51.0, lat1=54.2)
+CURRENT_FINE_N = (601, 641)      # 0.008° x 0.005°
+WAVES_FINE_N = (801, 801)        # 0.006° x 0.004°
+# HARMONIE GRIB1 fields: (indicatorOfParameter, levelType, level) -> name, conversion, int16 scale
+HM = {
+    "u10": ((33, 105, 10), lambda a: a, 0.01),                 # m/s
+    "v10": ((34, 105, 10), lambda a: a, 0.01),
+    "gu": ((162, 105, 10), lambda a: a, 0.01),                 # gust components, combined into "gust"
+    "gv": ((163, 105, 10), lambda a: a, 0.01),
+    "t2m": ((11, 105, 2), lambda a: a - 273.15, 0.01),         # °C
+    "td2m": ((17, 105, 2), lambda a: a - 273.15, 0.01),        # °C
+    "rh": ((52, 105, 2), lambda a: a * 100 if np.nanmax(a) <= 1.5 else a, 0.01),   # %
+    "mslp": ((1, 103, 0), lambda a: a / 100, 0.1),             # hPa
+    "precip": ((61, 105, 0), lambda a: a, 0.01),               # accumulated kg/m2 -> mm/h below
+    "tcc": ((71, 105, 0), lambda a: a * 100 if np.nanmax(a) <= 1.5 else a, 0.01),  # %
+    "lcc": ((73, 105, 0), lambda a: a * 100 if np.nanmax(a) <= 1.5 else a, 0.01),
+    "mcc": ((74, 105, 0), lambda a: a * 100 if np.nanmax(a) <= 1.5 else a, 0.01),
+    "hcc": ((75, 105, 0), lambda a: a * 100 if np.nanmax(a) <= 1.5 else a, 0.01),
+    "vis": ((20, 105, 0), lambda a: a, 10),                    # m
+}
 UPDATE_UTC = (4, 40)   # must match the cron in .github/workflows/update.yml
+KN_PER_MS = 1.943844
 UA = {"User-Agent": "kite-forecast/1.0 (personal, non-commercial)"}
 
 
@@ -147,6 +187,126 @@ def fetch_wind():
     }
 
 
+# ---------------------------------------------------------------- MAP FRAMES
+def write_frame(out, field, t, a, scale):
+    """Save one map frame as gzip(int16), row 0 = south. Returns the file size."""
+    q = np.where(np.isfinite(a), np.round(np.asarray(a, dtype=float) / scale), -32768)
+    q = np.clip(q, -32768, 32767).astype("<i2")
+    d = os.path.join(out, "f", field)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"{t}.bin.gz")
+    with open(path, "wb") as fh:
+        fh.write(gzip.compress(q.tobytes(), 6))
+    return os.path.getsize(path)
+
+
+# ---------------------------------------------------------------- HARMONIE (KNMI)
+def knmi(path, key, **kw):
+    r = requests.get(f"{KNMI_API}{path}", headers={"Authorization": key, **UA}, timeout=60, **kw)
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_harmonie(out):
+    """Download the newest HARMONIE P1 run, write every map frame, and return
+    (layer info, wind block for forecast.json)."""
+    key = os.environ.get("KNMI_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("no KNMI_API_KEY set")
+    files = knmi("/files", key, params={"maxKeys": 5, "orderBy": "created", "sorting": "desc"})["files"]
+    name = files[0]["filename"]
+    url = knmi(f"/files/{name}/url", key)["temporaryDownloadUrl"]
+    log(f"harmonie: {name} ({files[0].get('size', 0) / 1e6:.0f} MB)")
+
+    grid = run = None
+    times, acc = [], {}
+    sizes, written = 0, set()
+    inventory_done = False
+    wind = {"u": [], "v": [], "gust": [], "times": []}
+    with requests.get(url, stream=True, timeout=300) as r:
+        r.raise_for_status()
+        r.raw.decode_content = True
+        with tarfile.open(fileobj=r.raw, mode="r|*") as tar:
+            for member in tar:
+                if not member.isfile():
+                    continue
+                data = tar.extractfile(member).read()
+                got, valid = {}, None
+                msgs = list(messages(data))
+                if not inventory_done:
+                    log("  GRIB inventory of", member.name, ":",
+                        " ".join(f"{m.param}/{m.levtype}/{m.level}" for m in msgs))
+                    inventory_done = True
+                want = {v[0]: k for k, v in HM.items()}
+                for m in msgs:
+                    k = want.get(m.key)
+                    if k is None or k in got:
+                        continue
+                    got[k] = HM[k][1](m.values())
+                    valid = m.valid
+                    if grid is None:
+                        g = m.grid
+                        grid = dict(lon0=g["lon0"], dlon=g["dlon"], nx=g["ni"], lat0=g["lat0"], dlat=g["dlat"], ny=g["nj"])
+                        run = m.ref
+                if valid is None or "u10" not in got:
+                    continue
+                lead = (valid - run).total_seconds() / 3600
+                if lead > WEATHER_H:
+                    continue
+                t = int(valid.timestamp())
+                # precipitation is a running total: hourly amounts are written after the loop
+                if "precip" in got:
+                    acc[t] = got.pop("precip")
+                if "gu" in got and "gv" in got:
+                    got["gust"] = np.hypot(got.pop("gu"), got.pop("gv"))
+                for k, a in got.items():
+                    scale = HM[k][2] if k in HM else 0.01
+                    sizes += write_frame(out, k, t, a, scale)
+                    written.add(k)
+                times.append(t)
+                # spot/chart wind: the coastal box at full resolution
+                if "gust" in got and "v10" in got:
+                    wind["times"].append(t)
+                    for k, src in (("u", "u10"), ("v", "v10"), ("gust", "gust")):
+                        wind[k].append(got[src])
+                log(f"  +{lead:.0f} h: {', '.join(sorted(got))}")
+    if not times:
+        raise RuntimeError("no usable HARMONIE fields found")
+    times = sorted(times)
+    ts = sorted(acc)
+    for i, t in enumerate(ts):   # mm in the hour that ends at t
+        if i == 0:
+            continue
+        sizes += write_frame(out, "precip", t, np.maximum(acc[t] - acc[ts[i - 1]], 0), HM["precip"][2])
+        written.add("precip")
+    log(f"harmonie: {len(times)} hours written, {sizes / 1e6:.0f} MB")
+    info = {"source": "KNMI HARMONIE-AROME Cy43 P1 (2.5 km)", "run": iso(run), "grid": grid,
+            "times": times, "fields": {k: {"scale": (HM[k][2] if k in HM else 0.01)} for k in sorted(written)}}
+    if "precip" in written:
+        info["fields"]["precip"]["times"] = ts[1:]
+    return info, harmonie_wind_block(grid, wind, run)
+
+
+def harmonie_wind_block(grid, w, run):
+    """forecast.json wind block (same format as before): HARMONIE cut to the coastal box."""
+    lon = grid["lon0"] + np.arange(grid["nx"]) * grid["dlon"]
+    lat = grid["lat0"] + np.arange(grid["ny"]) * grid["dlat"]
+    xi = np.where((lon >= BBOX["lon0"] - 0.05) & (lon <= BBOX["lon1"] + 0.05))[0]
+    yi = np.where((lat >= BBOX["lat0"] - 0.05) & (lat <= BBOX["lat1"] + 0.05))[0]
+    order = np.argsort(w["times"])
+    cut = lambda a: a[yi[0]:yi[-1] + 1, xi[0]:xi[-1] + 1] * KN_PER_MS  # noqa: E731
+    return {
+        "source": "KNMI HARMONIE-AROME Cy43 P1 (2.5 km)",
+        "run": iso(run),
+        "grid": dict(lon0=float(lon[xi[0]]), dlon=grid["dlon"], nx=len(xi), lat0=float(lat[yi[0]]), dlat=grid["dlat"], ny=len(yi)),
+        "times": [w["times"][i] for i in order],
+        "units": "u,v,gust in 0.1 kn",
+        "u": [ints(cut(w["u"][i]), 10) for i in order],
+        "v": [ints(cut(w["v"][i]), 10) for i in order],
+        "gust": [ints(cut(w["gust"][i]), 10) for i in order],
+    }
+
+
 # ---------------------------------------------------------------- MATROOS
 def matroos_last_anal(source):
     now = dt.datetime.now(dt.timezone.utc)
@@ -161,33 +321,55 @@ def matroos_last_anal(source):
     return sorted(anals)[-1]
 
 
-def fetch_matroos(source, fields, bbox=BBOX, n=MARINE_N):
+def fetch_matroos(source, fields, bbox=BBOX, n=MARINE_N, chunk_h=None):
+    """Matroos regridded to a regular lat/lon grid. chunk_h splits big requests into time windows
+    (Matroos answers 503 when one request is too large)."""
     anal = matroos_last_anal(source)
     t0 = dt.datetime.strptime(anal, "%Y%m%d%H%M").replace(tzinfo=dt.timezone.utc)
-    t1 = t0 + dt.timedelta(hours=HORIZON_H)
+    t_end = t0 + dt.timedelta(hours=HORIZON_H)
+    step = dt.timedelta(hours=chunk_h or HORIZON_H + 1)
     xn, yn = n
     log(f"{source}: run {anal}, fields {fields}, grid {xn}x{yn}")
     out = {}
     times = grid = None
     for f in fields:  # one field per request keeps Matroos' interpolation fast and errors isolated
-        r = get(f"{MATROOS}/get_matroos.php", params={
-            "source": source, "anal": anal, "color": f,
-            "from": t0.strftime("%Y%m%d%H%M"), "to": t1.strftime("%Y%m%d%H%M"), "dtmin": 60,
-            "xmin": bbox["lon0"], "xmax": bbox["lon1"], "ymin": bbox["lat0"], "ymax": bbox["lat1"],
-            "xn": xn, "yn": yn, "coords": "WGS84", "format": "nc",
-        }, timeout=600)
-        nc = NC3(r.content)
-        x, y = nc.get("x"), nc.get("y")
-        tm = nc.get("time")
-        ts = [int(m * 60) for m in tm]
-        keep = [i for i, t in enumerate(ts) if t % 3600 == 0]   # hourly only
+        frames, fts = [], []
+        a_from = t0
+        while a_from <= t_end:
+            a_to = min(a_from + step - dt.timedelta(hours=1), t_end)
+            r = get(f"{MATROOS}/get_matroos.php", params={
+                "source": source, "anal": anal, "color": f,
+                "from": a_from.strftime("%Y%m%d%H%M"), "to": a_to.strftime("%Y%m%d%H%M"), "dtmin": 60,
+                "xmin": bbox["lon0"], "xmax": bbox["lon1"], "ymin": bbox["lat0"], "ymax": bbox["lat1"],
+                "xn": xn, "yn": yn, "coords": "WGS84", "format": "nc",
+            }, timeout=600)
+            a_from = a_to + dt.timedelta(hours=1)
+            if not r.content.startswith(b"CDF"):
+                if fts:
+                    break       # past the end of the model run
+                raise RuntimeError(f"Matroos: {r.text[:200]}")
+            nc = NC3(r.content)
+            ts = [int(m * 60) for m in nc.get("time")]
+            if not ts:
+                break
+            keep = [i for i, t in enumerate(ts) if t % 3600 == 0 and t not in fts]   # hourly only
+            if grid is None:
+                x, y = nc.get("x"), nc.get("y")
+                grid = dict(lon0=float(x[0]), dlon=float((x[-1] - x[0]) / (len(x) - 1)), nx=len(x),
+                            lat0=float(y[0]), dlat=float((y[-1] - y[0]) / (len(y) - 1)), ny=len(y))
+            a = nc.get(f)
+            frames.append(a[keep].astype(np.float32))
+            fts += [ts[i] for i in keep]
+        a = np.concatenate(frames)
         if times is None:
-            times = [ts[i] for i in keep]
-            grid = dict(lon0=float(x[0]), dlon=float((x[-1] - x[0]) / (len(x) - 1)), nx=len(x),
-                        lat0=float(y[0]), dlat=float((y[-1] - y[0]) / (len(y) - 1)), ny=len(y))
-        a = nc.get(f)
-        out[f] = a[keep]
-        log(f"  {f}: {len(keep)} frames, range {np.nanmin(a):.2f}..{np.nanmax(a):.2f}")
+            times = fts
+        elif fts != times:   # keep the hours every field has
+            common = sorted(set(times) & set(fts))
+            out = {k: v[[times.index(t) for t in common]] for k, v in out.items()}
+            a = a[[fts.index(t) for t in common]]
+            times = common
+        out[f] = a
+        log(f"  {f}: {len(fts)} frames, range {np.nanmin(a):.2f}..{np.nanmax(a):.2f}")
     return iso(t0), times, grid, out
 
 
@@ -215,6 +397,47 @@ def fetch_current(bbox=BBOX, n=MARINE_N, label="Rijkswaterstaat DCSM7/ZUNO (Matr
     }
 
 
+def fetch_marine_frames(out):
+    """Full-resolution current and wave map frames."""
+    info = {}
+    for kind, source, fields, n, chunk, label in (
+        ("current", CURRENT_SOURCE, CURRENT_FIELDS, CURRENT_FINE_N, 24, "Rijkswaterstaat DCSM7/ZUNO (Matroos)"),
+        ("waves", WAVE_SOURCE, ["wave_height_hm0", "wave_period_tm10", "swellwave_height_hm0"], WAVES_FINE_N, 6,
+         "Rijkswaterstaat SWAN Kuststrook (Matroos)"),
+    ):
+        try:
+            run, times, grid, f = fetch_matroos(source, fields, MARINE_BOX, n, chunk)
+            names = {"VELU": "cu", "VELV": "cv", "wave_height_hm0": "hs", "wave_period_tm10": "tm", "swellwave_height_hm0": "swell"}
+            size = 0
+            for fld, arr in f.items():
+                for i, t in enumerate(times):
+                    size += write_frame(out, names[fld], t, arr[i], 0.01)
+            info[kind] = {"source": label, "run": run, "grid": grid, "times": times,
+                          "fields": {names[k]: {"scale": 0.01} for k in f}}
+            log(f"{kind} frames: {len(times)} hours, {size / 1e6:.0f} MB")
+        except Exception as e:  # noqa: BLE001
+            log(f"!! {kind} frames failed: {e}")
+            info[kind] = {"error": str(e)[:300]}
+    return info
+
+
+def copy_previous_frames(site, kind, out):
+    """Reuse the previous run's frames of one source (downloaded from the live site)."""
+    prev = requests.get(f"{site}/data/layers.json", timeout=60, headers=UA).json()[kind]
+    n = 0
+    for fld in prev["fields"]:
+        d = os.path.join(out, "f", fld)
+        os.makedirs(d, exist_ok=True)
+        for t in prev["times"]:
+            r = get(f"{site}/data/f/{fld}/{t}.bin.gz", timeout=60, tries=2)
+            with open(os.path.join(d, f"{t}.bin.gz"), "wb") as fh:
+                fh.write(r.content)
+            n += 1
+    prev["stale"] = True
+    log(f"   kept previous {kind} frames ({n} files, run {prev.get('run')})")
+    return prev
+
+
 # ---------------------------------------------------------------- MAIN
 def next_update(now):
     t = now.replace(hour=UPDATE_UTC[0], minute=UPDATE_UTC[1], second=0, microsecond=0)
@@ -225,7 +448,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="docs/data")
     ap.add_argument("--previous", help="previous forecast.json; used for any source that fails")
+    ap.add_argument("--previous-site", help="URL of the live site, to reuse its map frames when a source fails")
+    ap.add_argument("--weather-only", action="store_true", help="test: only fetch HARMONIE map frames (merged into an existing layers.json)")
     a = ap.parse_args()
+    os.makedirs(a.out, exist_ok=True)
+    if a.weather_only:
+        path = os.path.join(a.out, "layers.json")
+        layers = json.load(open(path)) if os.path.exists(path) else {}
+        layers["weather"], _ = fetch_harmonie(a.out)
+        with open(path, "w") as fh:
+            json.dump(layers, fh, separators=(",", ":"))
+        log("wrote", path)
+        return
 
     prev = {}
     if a.previous and os.path.exists(a.previous):
@@ -236,7 +470,30 @@ def main():
 
     now = dt.datetime.now(dt.timezone.utc)
     data = {"generated": iso(now), "next_update": iso(next_update(now)), "bbox": BBOX, "errors": {}}
-    for key, fn in (("wind", fetch_wind), ("waves", fetch_waves), ("current", fetch_current)):
+
+    # map layers (full resolution)
+    layers = {"generated": iso(now)}
+    hm_wind = None
+    try:
+        layers["weather"], hm_wind = fetch_harmonie(a.out)
+    except Exception as e:  # noqa: BLE001
+        log(f"!! harmonie failed: {e}")
+        layers["weather"] = {"error": str(e)[:300]}
+    layers.update(fetch_marine_frames(a.out))
+    for kind in ("weather", "current", "waves"):
+        if "error" in layers[kind] and a.previous_site:
+            try:
+                err = layers[kind]["error"]
+                layers[kind] = copy_previous_frames(a.previous_site, kind, a.out)
+                layers[kind]["error"] = err
+            except Exception as e:  # noqa: BLE001
+                log(f"   no previous {kind} frames: {e}")
+    with open(os.path.join(a.out, "layers.json"), "w") as fh:
+        json.dump(layers, fh, separators=(",", ":"))
+
+    # point data for spots and graphs; wind from the HARMONIE run above when we have it
+    fetchers = (("wind", (lambda: hm_wind) if hm_wind else fetch_wind), ("waves", fetch_waves), ("current", fetch_current))
+    for key, fn in fetchers:
         try:
             data[key] = fn()
             data[key]["fetched"] = iso(now)
@@ -250,7 +507,6 @@ def main():
     if not any(k in data for k in ("wind", "waves", "current")):
         sys.exit("all sources failed")
 
-    os.makedirs(a.out, exist_ok=True)
     path = os.path.join(a.out, "forecast.json")
     with open(path, "w") as fh:
         json.dump(data, fh, separators=(",", ":"))
