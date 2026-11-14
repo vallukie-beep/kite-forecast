@@ -33,6 +33,10 @@ WAVE_SOURCE = "swan_kuststrook_harmonie"
 WAVE_FIELDS = ["wave_height_hm0", "wave_period_tm10", "wave_dir_th0", "swellwave_height_hm0"]
 CURRENT_SOURCE = "dcsm7_harmonie_bf_f2w_zuno"
 CURRENT_FIELDS = ["VELU", "VELV"]
+# Wadden Sea (Texel to Terschelling): the same current model on a ~670 m grid so the tidal channels show.
+# Written to a separate file (wadden.json) that the page loads after the main forecast.
+WADDEN_BBOX = dict(lon0=4.65, lon1=5.70, lat0=52.90, lat1=53.45)
+WADDEN_N = (106, 92)                                          # 0.01° lon x 0.006° lat
 HORIZON_H = 72
 UPDATE_UTC = (4, 40)   # must match the cron in .github/workflows/update.yml
 UA = {"User-Agent": "kite-forecast/1.0 (personal, non-commercial)"}
@@ -157,19 +161,19 @@ def matroos_last_anal(source):
     return sorted(anals)[-1]
 
 
-def fetch_matroos(source, fields):
+def fetch_matroos(source, fields, bbox=BBOX, n=MARINE_N):
     anal = matroos_last_anal(source)
     t0 = dt.datetime.strptime(anal, "%Y%m%d%H%M").replace(tzinfo=dt.timezone.utc)
     t1 = t0 + dt.timedelta(hours=HORIZON_H)
-    xn, yn = MARINE_N
-    log(f"{source}: run {anal}, fields {fields}")
+    xn, yn = n
+    log(f"{source}: run {anal}, fields {fields}, grid {xn}x{yn}")
     out = {}
     times = grid = None
     for f in fields:  # one field per request keeps Matroos' interpolation fast and errors isolated
         r = get(f"{MATROOS}/get_matroos.php", params={
             "source": source, "anal": anal, "color": f,
             "from": t0.strftime("%Y%m%d%H%M"), "to": t1.strftime("%Y%m%d%H%M"), "dtmin": 60,
-            "xmin": BBOX["lon0"], "xmax": BBOX["lon1"], "ymin": BBOX["lat0"], "ymax": BBOX["lat1"],
+            "xmin": bbox["lon0"], "xmax": bbox["lon1"], "ymin": bbox["lat0"], "ymax": bbox["lat1"],
             "xn": xn, "yn": yn, "coords": "WGS84", "format": "nc",
         }, timeout=600)
         nc = NC3(r.content)
@@ -200,10 +204,10 @@ def fetch_waves():
     }
 
 
-def fetch_current():
-    run, times, grid, f = fetch_matroos(CURRENT_SOURCE, CURRENT_FIELDS)
+def fetch_current(bbox=BBOX, n=MARINE_N, label="Rijkswaterstaat DCSM7/ZUNO (Matroos)"):
+    run, times, grid, f = fetch_matroos(CURRENT_SOURCE, CURRENT_FIELDS, bbox, n)
     return {
-        "source": "Rijkswaterstaat DCSM7/ZUNO (Matroos)",
+        "source": label,
         "run": run, "grid": grid, "times": times,
         "units": "u,v in cm/s (u toward east, v toward north)",
         "u": [ints(fr, 100) for fr in f["VELU"]],
@@ -251,6 +255,17 @@ def main():
     with open(path, "w") as fh:
         json.dump(data, fh, separators=(",", ":"))
     log(f"wrote {path} ({os.path.getsize(path) / 1e6:.1f} MB)")
+
+    # fine Wadden Sea current; optional, the page works without it
+    try:
+        wad = {"generated": iso(now), "bbox": WADDEN_BBOX,
+               "current": fetch_current(WADDEN_BBOX, WADDEN_N, "Rijkswaterstaat DCSM7/ZUNO, fine Wadden grid (Matroos)")}
+        path = os.path.join(a.out, "wadden.json")
+        with open(path, "w") as fh:
+            json.dump(wad, fh, separators=(",", ":"))
+        log(f"wrote {path} ({os.path.getsize(path) / 1e6:.1f} MB)")
+    except Exception as e:  # noqa: BLE001
+        log(f"!! wadden current failed (page falls back to the coarse grid): {e}")
 
 
 if __name__ == "__main__":
