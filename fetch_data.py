@@ -101,7 +101,8 @@ def fetch_wind():
             "forecast_hours": HORIZON_H,
             "cell_selection": "nearest",
         }
-        res = get("https://api.open-meteo.com/v1/forecast", params=params).json()
+        # short timeout: a normal answer takes ~1 s; a hanging connection should fail fast and retry
+        res = get("https://api.open-meteo.com/v1/forecast", params=params, timeout=45, tries=5).json()
         if isinstance(res, dict):
             res = [res]
         for r in res:
