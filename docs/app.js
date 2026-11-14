@@ -420,6 +420,15 @@ map.on('moveend', () => {
   const b = map.getBounds(); store.set('kf.view', [[b.getSouth(), b.getWest()], [b.getNorth(), b.getEast()]]);
 });
 map.on('resize', () => { placeCanvases(); redrawMap(); resetParticles(); });
+// keep colours and arrows under the finger while dragging (throttled; skipped during zoom animations)
+let zooming = false, lastLive = 0;
+map.on('zoomstart', () => { zooming = true; });
+map.on('zoomend', () => { zooming = false; });
+map.on('move', () => {
+  const now = performance.now();
+  if (zooming || now - lastLive < 120 || !S.D) return;
+  lastLive = now; placeCanvases(); redrawMap();
+});
 
 // hover readout
 map.on('mousemove', (e) => { if (S.D) showReadout(e.latlng.lat, e.latlng.lng); });
