@@ -25,6 +25,7 @@ const SEED_SPOTS = [
   { name: 'Wijk aan Zee', lat: 52.494, lon: 4.584 },
   { name: 'Texel Paal 17', lat: 53.081, lon: 4.733 },
   { name: 'Terschelling West aan Zee', lat: 53.394, lon: 5.268 },
+  { name: 'Vlieland', lat: 53.315, lon: 5.060 },
 ];
 
 // ------------------------------------------------------------------ small helpers
@@ -99,6 +100,7 @@ const S = {
   sel: null, // {lat, lon, spotId, ser}
   spots: [],
   field: null,
+  W: null, // fine Wadden Sea current grid (data/wadden.json), loaded after the main forecast
 };
 
 // ------------------------------------------------------------------ data
@@ -209,10 +211,21 @@ function sampleAt(lat, lon, t, marinePos) {
     const p = marinePos ? marinePos.current : { lat, lon };
     if (p) { const u = bil(c.grid, c.U[ci], p.lat, p.lon), v = bil(c.grid, c.V[ci], p.lat, p.lon); o.cs = Math.hypot(u, v); o.cd = bearingOf(u, v); } // to
   }
+  // inside the Wadden grid the fine grid wins; a gap there means a dry flat at that hour
+  const W = S.W, fi = W && W.idx.get(t), fp = marinePos ? marinePos.wadden : (W && inGrid(W.grid, lat, lon) ? { lat, lon } : null);
+  if (W && fi !== undefined && fp) {
+    const u = bil(W.grid, W.U[fi], fp.lat, fp.lon, 0.75), v = bil(W.grid, W.V[fi], fp.lat, fp.lon, 0.75);
+    o.cs = Math.hypot(u, v); o.cd = Number.isFinite(o.cs) ? bearingOf(u, v) : NaN; o.cfine = true;
+  }
   return o;
 }
+const inGrid = (g, lat, lon) => lon >= g.lon0 && lat >= g.lat0 && lon <= g.lon0 + (g.nx - 1) * g.dlon && lat <= g.lat0 + (g.ny - 1) * g.dlat;
 function marinePosFor(lat, lon) {
   const pos = {};
+  if (S.W && inGrid(S.W.grid, lat, lon)) {
+    const g = S.W.grid, A = S.W.U[0];
+    pos.wadden = bil(g, A, lat, lon, 0.75) === bil(g, A, lat, lon, 0.75) ? { lat, lon, d: 0 } : nearestSea(g, A, lat, lon, 4);
+  }
   for (const [k, key] of [['waves', 'HS'], ['current', 'U']]) {
     const ds = S.D[k]; if (!ds) continue;
     const A = ds[key][0];
@@ -286,13 +299,19 @@ const BASES = {
   dark: () => [L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png', { maxZoom: 18, subdomains: 'abcd', attribution: '© OpenStreetMap contributors © CARTO' }),
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}{r}.png', { pane: 'labels', maxZoom: 18, subdomains: 'abcd' })],
   osm: () => [L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 18, attribution: '© OpenStreetMap contributors' })],
+  sea: () => [L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 18, attribution: '© OpenStreetMap contributors' })],
 };
+const BASE_NAMES = { sat: 'Satellite', dark: 'Dark map', osm: 'Street map', sea: 'Sea chart (OpenSeaMap)' };
+// OpenSeaMap sea marks (buoys, lights, fairways): drawn above the wind colours, on any background
+const seamarks = L.tileLayer('https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png', { pane: 'labels', maxZoom: 18, attribution: 'Sea marks © OpenSeaMap contributors' });
+function setSeamarks(on) { S.ly.seamarks = !!on; store.set('kf.layers', S.ly); if (on) seamarks.addTo(map); else map.removeLayer(seamarks); const el = $('lySeamarks'); if (el) el.checked = !!on; }
 let baseLayers = [];
 function setBase(k) {
   if (!BASES[k]) k = 'sat';
   baseLayers.forEach((l) => map.removeLayer(l));
   baseLayers = BASES[k]().map((l) => l.addTo(map));
   S.base = k; store.set('kf.base', k); $('baseSel').value = k;
+  if (k === 'sea') setSeamarks(true);
 }
 map.attributionControl.addAttribution('Wind: KNMI HARMONIE via Open-Meteo · Waves/current: Rijkswaterstaat Matroos');
 
@@ -379,37 +398,120 @@ function arrow(ctx, x, y, bearing, len, color, width) {
   path(); ctx.strokeStyle = 'rgba(0,0,0,0.55)'; ctx.lineWidth = width + 2.2; ctx.stroke();
   path(); ctx.strokeStyle = color; ctx.lineWidth = width; ctx.stroke();
 }
+// example run from the beach, all at 10 kn through the water, with the current at the spot added to every leg:
+//  1. out: 1 km at 70° off the wind, on the seaward tack
+//  2. back: at 60° off the wind until 100 m off the beach
+//  3. downwind: along the beach, back to the line through the start square to the coast.
+// The length of 3 is the upwind ground gained; it is compared with the same run in still water.
+const KITE_KN = 10, OUT_M = 1000, OUT_ANG = 70, BACK_ANG = 60, SHORE_M = 100, MS_PER_KN = 0.514444, SCORE_M = 200;
+function simTrack(spot, wd, cs, cd) {
+  const V = KITE_KN * MS_PER_KN, vec = (b, m) => [m * Math.sin(b * RAD), m * Math.cos(b * RAD)];
+  const dot = (a, b) => a[0] * b[0] + a[1] * b[1];
+  const f = vec(spot.facing, 1);                                             // seaward unit vector
+  const pick = (a, b, sea) => ((dot(vec(a, 1), f) >= dot(vec(b, 1), f)) === sea ? a : b);
+  const h1 = pick(norm360(wd + OUT_ANG), norm360(wd - OUT_ANG), true);      // tack that goes out
+  const h2 = pick(norm360(wd + BACK_ANG), norm360(wd - BACK_ANG), false);   // tack that comes back
+  const c = vec(cd, cs * MS_PER_KN);
+  const t1 = OUT_M / V, g1 = vec(h1, V); g1[0] += c[0]; g1[1] += c[1];
+  const P1 = [g1[0] * t1, g1[1] * t1];
+  const g2 = vec(h2, V); g2[0] += c[0]; g2[1] += c[1];
+  const off1 = dot(P1, f), in2 = -dot(g2, f);                               // m off the beach, approach speed
+  if (off1 <= SHORE_M || in2 <= 0.05) return { h1, h2, P1, fail: off1 <= SHORE_M ? 'the current keeps you on the beach' : 'you cannot get back on this tack' };
+  const t2 = (off1 - SHORE_M) / in2, P2 = [P1[0] + g2[0] * t2, P1[1] + g2[1] * t2];
+  // along the beach, the "upwind" way
+  let up = [-f[1], f[0]]; const wTo = vec(wd + 180, 1); if (dot(up, wTo) > 0) up = [-up[0], -up[1]];
+  const gain = dot(P2, up), P3 = [P2[0] - up[0] * gain, P2[1] - up[1] * gain];
+  return { h1, h2, P1, P2, P3, gain, secs: t1 + t2, t1, t2 };
+}
+function kiteTrack(spot, r) {
+  if (!r || !Number.isFinite(r.wd)) return null;
+  const noCur = !Number.isFinite(r.cs);
+  const k = simTrack(spot, r.wd, noCur ? 0 : r.cs, noCur ? 0 : r.cd);
+  const still = simTrack(spot, r.wd, 0, 0);
+  k.still = still.fail ? null : still.gain; k.noCur = noCur; k.cs = r.cs; k.cd = r.cd; k.wd = r.wd;
+  k.help = k.fail || k.still == null ? null : k.gain - k.still;               // metres the current adds (+) or costs (−)
+  return k;
+}
+// red (current runs with the wind) → yellow (like still water) → green (current carries you upwind)
+function scoreColor(help) {
+  if (help == null) return '#ef4444';
+  const x = Math.max(-1, Math.min(1, help / SCORE_M));
+  const mix = (a, b, t) => '#' + [0, 2, 4].map((i) => Math.round(parseInt(a.substr(i, 2), 16) * (1 - t) + parseInt(b.substr(i, 2), 16) * t).toString(16).padStart(2, '0')).join('');
+  return x < 0 ? mix('facc15', 'ef4444', -x) : mix('facc15', '22c55e', x);
+}
+const trackText = (k) => k.fail ? `No downwind run: ${k.fail}.` :
+  `Downwind run ${Math.round(k.gain)} m (still water ${k.still == null ? '–' : Math.round(k.still)} m), ` +
+  (k.noCur ? 'no current data.' : `current ${k.help >= 0 ? 'adds' : 'costs'} ${Math.abs(Math.round(k.help))} m.`);
+
 function drawArrows() {
   const o = CV.arrows, ctx = o.ctx, sz = map.getSize();
   ctx.clearRect(0, 0, sz.x, sz.y);
-  const D = S.D; if (!D) return;
-  const t = S.times[S.ti], z = map.getZoom(), sp = z >= 11 ? 56 : 44, labels = z >= 10.5;
-  ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.font = '600 10px -apple-system, sans-serif'; ctx.textAlign = 'center';
-  const wv = D.waves, vi = wv && wv.idx.get(t), c = D.current, ci = c && c.idx.get(t);
-  const text = (s, x, y, col) => { ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(0,0,0,.7)'; ctx.strokeText(s, x, y); ctx.fillStyle = col; ctx.fillText(s, x, y); };
-  for (let y = sp / 2; y < sz.y; y += sp) for (let x = sp / 2; x < sz.x; x += sp) {
-    if ((S.ly.waves || S.ly.swell) && vi !== undefined) {
-      const ll = map.containerPointToLatLng([x, y]), g = wv.grid;
-      const hs = bil(g, S.ly.swell ? wv.SW[vi] : wv.HS[vi], ll.lat, ll.lng);
-      if (hs > 0.03) {
-        const from = bearingOf(bil(g, wv.DX[vi], ll.lat, ll.lng), bil(g, wv.DY[vi], ll.lat, ll.lng));
-        const col = S.ly.swell ? '#c4b5fd' : '#ffffff';
-        arrow(ctx, x, y, from + 180, 9 + 9 * Math.min(hs, 3), col, 1.3 + Math.min(hs, 3) * 0.6);
-        if (labels) text(hs.toFixed(1), x, y - 10, col);
+  const D = S.D; if (!D || !S.spotSer) return;
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.font = '600 10px -apple-system, sans-serif';
+  const text = (s, x, y, col, align = 'center') => { ctx.textAlign = align; ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(0,0,0,.75)'; ctx.strokeText(s, x, y); ctx.fillStyle = col; ctx.fillText(s, x, y); };
+  // sailing layer: current arrows over the Wadden Sea from the fine grid
+  const W = S.W, fi = W && W.idx.get(S.times[S.ti]);
+  if (S.ly.wadden && W && fi !== undefined) {
+    // zoomed in: one arrow per ~3 cm of screen (113 CSS px); zoomed out a denser grid so the area isn't empty
+    const z = map.getZoom(), sp = z >= 11 ? 113 : z >= 10 ? 70 : 46, len = z >= 11 ? 1.6 : 1;
+    const g = W.grid, lab = z >= 11;
+    const a = map.latLngToContainerPoint([g.lat0 + (g.ny - 1) * g.dlat, g.lon0]), b = map.latLngToContainerPoint([g.lat0, g.lon0 + (g.nx - 1) * g.dlon]);
+    for (let y = Math.max(sp / 2, a.y + sp / 2); y < Math.min(sz.y, b.y); y += sp) for (let x = Math.max(sp / 2, a.x + sp / 2); x < Math.min(sz.x, b.x); x += sp) {
+      const ll = map.containerPointToLatLng([x, y]);
+      const u = bil(g, W.U[fi], ll.lat, ll.lng, 0.75), v = bil(g, W.V[fi], ll.lat, ll.lng, 0.75), s = Math.hypot(u, v);
+      if (!(s > 0.05)) continue;
+      arrow(ctx, x, y, bearingOf(u, v), (10 + 12 * Math.min(s, 2.5)) * len, '#22d3ee', z >= 11 ? 2 : 1.5);
+      if (lab) text(`${s.toFixed(1)} kn`, x, y + 18, '#67e8f9');
+    }
+  }
+  for (const spot of S.spots) {
+    const ser = S.spotSer.get(spot.id), r = ser && ser.rows[S.ti]; if (!r) continue;
+    const p = map.latLngToContainerPoint([spot.lat, spot.lon]);
+    if (p.x < -200 || p.y < -200 || p.x > sz.x + 200 || p.y > sz.y + 200) continue;
+    // ---- example run (true scale when zoomed in, enlarged otherwise; the labels give the real metres)
+    const k = kiteTrack(spot, r);
+    if (k) {
+      const q = map.latLngToContainerPoint([spot.lat + 1000 / 110570, spot.lon]);
+      const sc = Math.max((p.y - q.y) / 1000, 110 / 1000);                    // px per metre
+      const P = (m) => [p.x + m[0] * sc, p.y - m[1] * sc];
+      const line = (pts, col, w, dash) => {
+        ctx.setLineDash(dash || []); ctx.beginPath(); pts.forEach((m, i) => (i ? ctx.lineTo : ctx.moveTo).call(ctx, ...P(m)));
+        ctx.strokeStyle = 'rgba(0,0,0,.6)'; ctx.lineWidth = w + 2; ctx.stroke(); ctx.strokeStyle = col; ctx.lineWidth = w; ctx.stroke(); ctx.setLineDash([]);
+      };
+      const col = scoreColor(k.help);
+      if (k.fail) line([[0, 0], k.P1], '#fff', 1.6, [5, 4]);
+      else {
+        line([[0, 0], k.P1, k.P2], '#fff', 1.6, [5, 4]);
+        line([k.P2, k.P3], col, 4);
+        const A = P(k.P2), B = P(k.P3);
+        if (Math.hypot(B[0] - A[0], B[1] - A[1]) > 10) arrow(ctx, (A[0] + B[0]) / 2, (A[1] + B[1]) / 2, bearingOf(B[0] - A[0], A[1] - B[1]), 12, col, 2.5);
+        for (const m of [k.P1, k.P2]) { const [x, y] = P(m); ctx.beginPath(); ctx.arc(x, y, 3, 0, 2 * Math.PI); ctx.fillStyle = '#fff'; ctx.fill(); }
+      }
+      if (map.getZoom() >= 10) {
+        const E = P(k.fail ? k.P1 : k.P2), left = E[0] < p.x, tx = E[0] + (left ? -8 : 8), al = left ? 'right' : 'left';
+        if (k.fail) text('no downwind run', tx, E[1], '#fca5a5', al);
+        else {
+          text(`downwind ${Math.round(k.gain)} m`, tx, E[1] - 4, col, al);
+          text(k.noCur ? 'no current data' : `current ${k.help >= 0 ? '+' : '−'}${Math.abs(Math.round(k.help))} m`, tx, E[1] + 9, '#a5f3fc', al);
+        }
       }
     }
-    if (S.ly.current && ci !== undefined) {
-      const cx = x + sp / 2, cy = y + sp / 2, ll = map.containerPointToLatLng([cx, cy]), g = c.grid;
-      const u = bil(g, c.U[ci], ll.lat, ll.lng), v = bil(g, c.V[ci], ll.lat, ll.lng), s = Math.hypot(u, v);
-      if (s > 0.05) {
-        arrow(ctx, cx, cy, bearingOf(u, v), 7 + 10 * Math.min(s, 2.5), '#22d3ee', 1.5);
-        if (labels) text(s.toFixed(1), cx, cy + 16, '#67e8f9');
+    // ---- wave and current at the spot (from the nearest sea point), beside the pin
+    if ((S.ly.waves || S.ly.swell) && Number.isFinite(r.hs)) {
+      const hs = S.ly.swell ? r.sw : r.hs, col = S.ly.swell ? '#c4b5fd' : '#ffffff';
+      if (Number.isFinite(hs)) {
+        arrow(ctx, p.x + 32, p.y - 12, r.vd + 180, 10 + 8 * Math.min(hs, 3), col, 1.3 + Math.min(hs, 3) * 0.6);
+        text(`${hs.toFixed(1)} m`, p.x + 48, p.y - 9, col, 'left');
       }
+    }
+    if (S.ly.current && Number.isFinite(r.cs)) {
+      arrow(ctx, p.x + 32, p.y + 16, r.cd, 8 + 10 * Math.min(r.cs, 2.5), '#22d3ee', 1.8);
+      text(`${r.cs.toFixed(1)} kn`, p.x + 48, p.y + 19, '#67e8f9', 'left');
     }
   }
 }
 
-function redrawMap() { buildField(); drawColor(); drawArrows(); }
+function redrawMap() { if (!S.D) return; buildField(); drawColor(); drawArrows(); }
 map.on('movestart zoomstart', () => {
   moving = true; CV.part.ctx.clearRect(0, 0, CV.part.c.width, CV.part.c.height);
 });
@@ -448,7 +550,7 @@ function setTime(i) {
   $('slider').value = S.ti;
   $('tLabel').textContent = tf(F.full, S.times[S.ti]);
   redrawMap();
-  if (S.sel) { drawChart(); drawCompass(); }
+  if (S.sel) { drawChart(); drawCompass(); renderWins(); }
 }
 function buildTimebar() {
   const sl = $('slider'), n = S.times.length;
@@ -503,9 +605,11 @@ function openPoint(lat, lon, spotId) {
   $('pTitle').textContent = spot ? spot.name : `${lat.toFixed(3)}° N, ${lon.toFixed(3)}° E`;
   const pos = S.sel.ser.pos, notes = [];
   for (const k of ['waves', 'current']) {
-    if (!pos[k]) notes.push(`no ${k} data here`);
-    else if (pos[k].d > 0.3) notes.push(`${k} from nearest sea point ${pos[k].d.toFixed(1)} km away`);
+    const q = k === 'current' && pos.wadden ? pos.wadden : pos[k];
+    if (!q) notes.push(`no ${k} data here`);
+    else if (q.d > 0.3) notes.push(`${k} from nearest sea point ${q.d.toFixed(1)} km away`);
   }
+  if (pos.wadden) notes.push('current from the fine Wadden grid (~670 m)');
   $('pSub').textContent = notes.join(' · ');
   $('btnSaveSpot').classList.toggle('hidden', !!spot);
   $('point').classList.remove('hidden');
@@ -650,6 +754,11 @@ function saveSpots() { store.set('kf.spots', S.spots); $('spotJson').value = JSO
 function loadSpots() {
   const sp = store.get('kf.spots', null);
   S.spots = Array.isArray(sp) ? sp : SEED_SPOTS.map((s) => ({ id: uid(), ...s, facing: null, th: { ...DEFAULT_TH } }));
+  // spots added to the defaults later: give them to browsers that saved their spots before
+  if (!store.get('kf.seedVlieland', false)) {
+    if (!S.spots.some((s) => /vlieland/i.test(s.name))) S.spots.push({ id: uid(), ...SEED_SPOTS.find((s) => s.name === 'Vlieland'), facing: null, th: { ...DEFAULT_TH } });
+    store.set('kf.seedVlieland', true);
+  }
   for (const s of S.spots) { if (s.facing == null) s.facing = estimateFacing(s.lat, s.lon); s.th = Object.assign({}, DEFAULT_TH, s.th); }
   saveSpots();
 }
@@ -658,8 +767,10 @@ function renderSpots() {
   spotLayer.clearLayers();
   const list = $('spotList'); list.innerHTML = '';
   if (!S.spots.length) list.innerHTML = '<p class="muted small">No spots yet.</p>';
+  S.spotSer = new Map();
   for (const s of S.spots) {
-    const ev = evaluate(s, pointSeries(s.lat, s.lon)), n = ev.wins.length;
+    const ser = pointSeries(s.lat, s.lon); S.spotSer.set(s.id, ser);
+    const ev = evaluate(s, ser), n = ev.wins.length;
     L.marker([s.lat, s.lon], { icon: L.divIcon({ className: 'spot-icon', html: `<div class="spot-pin ${n ? 'ok' : ''}" title="${esc(s.name)}">🪁${n ? `<b>${n}</b>` : ''}</div>`, iconSize: [26, 26] }) })
       .on('click', () => openPoint(s.lat, s.lon, s.id)).bindTooltip(`${esc(s.name)}: ${n ? n + ' kite window' + (n > 1 ? 's' : '') : 'no kite window'}`, { direction: 'top', offset: [0, -14] }).addTo(spotLayer);
     const el = document.createElement('div'); el.className = 'spot';
@@ -705,7 +816,7 @@ function renderSpotCfg() {
     <p class="muted small">Side-shore = wind roughly parallel to the beach. The margins say how far the wind may turn toward the sea (side-onshore) or toward the land (side-offshore). Offshore wind never passes with the side-offshore margin at 0. “Against the wind” means the current flows toward where the wind comes from, within the tolerance.</p>
     <button class="btn small danger" id="cfDelete">Delete spot</button></div>
     <div class="wins" id="cfWins"></div>`;
-  const upd = () => { saveSpots(); drawChart(); drawCompass(); renderWins(); renderSpots(); };
+  const upd = () => { saveSpots(); drawChart(); drawCompass(); renderWins(); renderSpots(); drawArrows(); };
   box.querySelectorAll('[data-k]').forEach((inp) => inp.addEventListener('change', () => {
     const k = inp.dataset.k;
     th[k] = inp.type === 'checkbox' ? inp.checked : (inp.value === '' ? '' : +inp.value);
@@ -716,7 +827,7 @@ function renderSpotCfg() {
   $('cfName').addEventListener('change', (e) => { spot.name = e.target.value || spot.name; $('pTitle').textContent = spot.name; upd(); });
   $('cfDelete').addEventListener('click', () => {
     if (!confirm(`Delete spot “${spot.name}”?`)) return;
-    S.spots = S.spots.filter((s) => s !== spot); saveSpots(); renderSpots(); closePanel('point');
+    S.spots = S.spots.filter((s) => s !== spot); saveSpots(); renderSpots(); drawArrows(); closePanel('point');
   });
   drawCompass(); renderWins();
 }
@@ -724,7 +835,12 @@ function renderWins() {
   const el = $('cfWins'); if (!el || !S.sel) return;
   const spot = S.spots.find((s) => s.id === S.sel.spotId); if (!spot) return;
   const ev = evaluate(spot, S.sel.ser);
-  el.innerHTML = '<b>Kite windows</b>' + (ev.wins.length ? ev.wins.map((w) => `<div class="win">✓ ${winText(w)}</div>`).join('') : '<div class="win none">None in this forecast. Hover the chart to see which condition fails each hour.</div>');
+  const k = kiteTrack(spot, S.sel.ser.rows[S.ti]);
+  const tack = k ? `<p class="small" style="margin:0 0 8px"><b>Example run</b> <span class="muted">(${tf(F.dayhm, S.times[S.ti])}, all legs at ${KITE_KN} kn)</span><br>` +
+    `Out ${OUT_M} m toward ${compass(k.h1)} (${OUT_ANG}° off the wind), back toward ${compass(k.h2)} (${BACK_ANG}° off the wind) until ${SHORE_M} m off the beach, ` +
+    `then downwind along the beach to where you started. Current ${k.noCur ? 'unknown' : `${fmt1(k.cs)} kn toward ${compass(k.cd)}`}.<br>` +
+    `<b style="color:${scoreColor(k.help)}">■</b> ${trackText(k)} <span class="muted">Red = the current costs ${SCORE_M} m or more, yellow = like still water, green = it gains ${SCORE_M} m or more.</span></p>` : '';
+  el.innerHTML = tack + '<b>Kite windows</b>' + (ev.wins.length ? ev.wins.map((w) => `<div class="win">✓ ${winText(w)}</div>`).join('') : '<div class="win none">None in this forecast. Hover the chart to see which condition fails each hour.</div>');
 }
 function drawCompass() {
   const el = $('compassSvg'); if (!el || !S.sel) return;
@@ -813,7 +929,42 @@ async function dispatchUpdate(tok) {
   show('This is taking longer than expected. The page will pick up the new data on its own once it is published.', false);
 }
 
+// ------------------------------------------------------------------ alert (Scheveningen only)
+const ALERT_SPOT = /scheveningen/i;
+const alerted = new Set();
+function checkAlert() {
+  const spot = S.spots.find((s) => ALERT_SPOT.test(s.name)); if (!spot || !S.spotSer) return;
+  const now = Date.now() / 1000, w = evaluate(spot, S.spotSer.get(spot.id)).wins.find((x) => x.t1 > now);
+  if (!w) return;
+  const key = `${spot.id}:${w.t0}`; if (alerted.has(key)) return; alerted.add(key);
+  const title = w.t0 <= now ? `Kite window open now at ${spot.name}` : `Kite window at ${spot.name} ${rel(w.t0)}`;
+  const body = winText(w);
+  const notify = () => { try { new Notification(title, { body, tag: key, icon: document.querySelector('link[rel=icon]').href }); } catch { /* not supported */ } };
+  if ('Notification' in window && Notification.permission === 'granted') notify();
+  let el = $('alertToast');
+  if (!el) { el = document.createElement('div'); el.id = 'alertToast'; el.className = 'card'; document.body.appendChild(el); }
+  el.style.cssText = 'top:64px;left:50%;transform:translateX(-50%);z-index:1200;max-width:min(520px,calc(100% - 20px));border-color:#22c55e;line-height:1.45';
+  const ask = 'Notification' in window && Notification.permission === 'default';
+  el.innerHTML = `<div style="display:flex;gap:8px;align-items:flex-start"><div>🪁 <b>${esc(title)}</b><br>${esc(body)}</div><button class="x" id="alertX">×</button></div>` +
+    `<div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap"><button class="btn small" id="alertOpen">Show</button>` +
+    (ask ? '<button class="btn small ghost" id="alertAsk">Also as a browser notification</button>' : '') + '</div>';
+  $('alertX').onclick = () => el.remove();
+  $('alertOpen').onclick = () => { el.remove(); setTime(Math.max(0, S.times.indexOf(w.t0))); map.setView([spot.lat, spot.lon], Math.max(map.getZoom(), 11)); openPoint(spot.lat, spot.lon, spot.id); };
+  if (ask) $('alertAsk').onclick = async () => { if ((await Notification.requestPermission()) === 'granted') { notify(); $('alertAsk').remove(); } };
+}
+
 // ------------------------------------------------------------------ boot
+async function loadWadden() {
+  try {
+    const r = await fetch(`data/wadden.json?v=${Date.now()}`, { cache: 'no-store' }); if (!r.ok) return;
+    const c = (await r.json()).current; if (!c) return;
+    c.idx = new Map(c.times.map((t, i) => [t, i]));
+    c.U = toFrames(c.u, 0.01 * KN_PER_MS); c.V = toFrames(c.v, 0.01 * KN_PER_MS); delete c.u; delete c.v;
+    S.W = c;
+    renderSpots(); drawArrows();
+    if (S.sel) openPoint(S.sel.lat, S.sel.lon, S.sel.spotId);
+  } catch { /* optional file */ }
+}
 async function fetchData() {
   try { const r = await fetch(`data/forecast.json?v=${Date.now()}`, { cache: 'no-store' }); if (!r.ok) return null; return await r.json(); } catch { return null; }
 }
@@ -827,9 +978,10 @@ function applyData(D) {
   renderSpots();
   setTime(i);
   if (S.sel) openPoint(S.sel.lat, S.sel.lon, S.sel.spotId);
+  checkAlert();
+  loadWadden();
 }
 async function boot() {
-  setBase(S.base);
   for (const [id, k] of [['lyColor', 'color'], ['lyParticles', 'particles'], ['lyWaves', 'waves'], ['lySwell', 'swell'], ['lyCurrent', 'current']]) {
     const el = $(id); el.checked = !!S.ly[k];
     el.addEventListener('change', () => {
@@ -841,7 +993,21 @@ async function boot() {
       drawColor(); drawArrows();
     });
   }
-  $('baseSel').addEventListener('change', (e) => setBase(e.target.value));
+  // background choices and the sea-marks switch are added here, so index.html needs no change
+  const sel = $('baseSel'); sel.innerHTML = Object.entries(BASE_NAMES).map(([k, n]) => `<option value="${k}">${n}</option>`).join(''); sel.value = S.base;
+  const lab = document.createElement('label');
+  lab.innerHTML = '<input type="checkbox" id="lySeamarks"> ⚓ Sea marks';
+  lab.title = 'OpenSeaMap buoys, beacons, lights and fairways (zoom in to see them)';
+  sel.after(lab);
+  const wl = document.createElement('label');
+  wl.innerHTML = '<input type="checkbox" id="lyWadden"> <span class="sw cur"></span>Wadden current';
+  wl.title = 'Current arrows over the Wadden Sea on a ~670 m grid (sailing). Zoom in for the numbers (knots).';
+  $('lyCurrent').parentElement.after(wl);
+  $('lyWadden').checked = !!S.ly.wadden;
+  $('lyWadden').addEventListener('change', (e) => { S.ly.wadden = e.target.checked; store.set('kf.layers', S.ly); drawArrows(); });
+  $('lySeamarks').addEventListener('change', (e) => setSeamarks(e.target.checked));
+  setSeamarks(S.ly.seamarks); setBase(S.base);
+  sel.addEventListener('change', (e) => setBase(e.target.value));
   drawLegend(); placeCanvases(); frame();
   const D = await fetchData();
   if (!D) { $('status').innerHTML = '<span class="warn">No forecast data yet. The first GitHub update has not run, or it failed.</span>'; return; }
