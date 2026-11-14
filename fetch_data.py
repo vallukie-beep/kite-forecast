@@ -80,7 +80,8 @@ def fetch_wind():
 
     run = None
     try:
-        meta = get("https://api.open-meteo.com/data/knmi_harmonie_arome_netherlands/static/meta.json").json()
+        # only used to show the run time; from GitHub's servers this file sometimes hangs, so give up quickly
+        meta = get("https://api.open-meteo.com/data/knmi_harmonie_arome_netherlands/static/meta.json", timeout=20, tries=2).json()
         run = dt.datetime.fromtimestamp(meta["last_run_initialisation_time"], dt.timezone.utc)
     except Exception as e:  # noqa: BLE001
         log("  (no run metadata)", e)
