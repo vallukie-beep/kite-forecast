@@ -19,7 +19,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -29,9 +29,13 @@ jobs:
       - name: Get the currently published data (fallback if a source fails)
         run: curl -fsSL "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/data/forecast.json" -o previous.json || echo "no previous data"
       - name: Fetch HARMONIE, SWAN and DCSM
+        env:
+          KNMI_API_KEY: ${{ secrets.KNMI_API_KEY }}   # set under Settings > Secrets and variables > Actions
         run: |
           mkdir -p site && cp -r docs/. site/
-          python fetch_data.py --out site/data --previous previous.json
+          python fetch_data.py --out site/data --previous previous.json \
+            --previous-site "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+          du -sh site/data
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
