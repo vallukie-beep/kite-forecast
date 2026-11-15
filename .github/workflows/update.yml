@@ -2,7 +2,7 @@ name: Update forecast
 
 on:
   schedule:
-    - cron: '40 4 * * *'   # daily 04:40 UTC (05:40 winter / 06:40 summer, NL time); keep in sync with UPDATE_UTC in fetch_data.py
+    - cron: '17 */3 * * *'   # every 3 hours at :17 UTC (GitHub sometimes skips a scheduled run); keep in sync with UPDATE_EVERY_H / UPDATE_MIN in fetch_data.py
   workflow_dispatch:        # the "Update now" button
   push:
     branches: [main]
