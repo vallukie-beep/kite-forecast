@@ -10,6 +10,14 @@ const REPO = (() => {
   if (h.endsWith('.github.io')) return { owner: h.split('.')[0], repo: location.pathname.split('/').filter(Boolean)[0] || h };
   return { owner: 'vallukie-beep', repo: 'kite-forecast' };
 })();
+// data folder; on localhost ?data=https://<user>.github.io/<repo>/data tests against live data
+const DATA = (() => {
+  try {
+    const q = new URLSearchParams(location.search).get('data');
+    if (q && /^(localhost|127\.0\.0\.1)$/.test(location.hostname) && /^https:\/\/[a-z0-9-]+\.github\.io\//.test(q)) return q.replace(/\/$/, '');
+  } catch { /* ignore */ }
+  return 'data';
+})();
 const ACTIONS_URL = `https://github.com/${REPO.owner}/${REPO.repo}/actions/workflows/${WORKFLOW}`;
 
 const DEFAULT_TH = {
@@ -134,9 +142,9 @@ const LAYERS = [
   { id: 'pressure', topic: 'weather', name: 'Pressure', icon: '🧭', fields: ['mslp'], val: (p) => p, unit: 'hPa', pal: 'pressure', lo: 960, hi: 1050, ticks: [970, 990, 1010, 1030, 1050], particles: 'wind', alpha: 0.85 },
   { id: 'vis', topic: 'weather', name: 'Visibility (fog)', icon: '👁', fields: ['vis'], val: (m) => m / 1000, unit: 'km', pal: 'vis', lo: 0, hi: 50, ticks: [0, 1, 5, 10, 20, 50], particles: 'wind', alpha: 0.85 },
   { id: 'current', topic: 'current', name: 'Current', icon: '🌊', fields: ['cu', 'cv'], val: (u, v) => Math.hypot(u, v) * KN, unit: 'kn', pal: 'current', lo: 0, hi: 4, ticks: [0, 0.5, 1, 1.5, 2, 3], particles: 'current', alpha: 0.85 },
-  { id: 'hs', topic: 'waves', name: 'Waves', icon: '〰', fields: ['hs'], val: (h) => h, unit: 'm', pal: 'waves', lo: 0, hi: 10, ticks: [0, 0.5, 1, 2, 3, 4, 6], particles: null, alpha: 0.85 },
-  { id: 'swell', topic: 'waves', name: 'Swell', icon: '🌀', fields: ['swell'], val: (h) => h, unit: 'm', pal: 'waves', lo: 0, hi: 10, ticks: [0, 0.5, 1, 2, 3, 4], particles: null, alpha: 0.85 },
-  { id: 'tm', topic: 'waves', name: 'Wave period', icon: '⏱', fields: ['tm'], val: (t) => t, unit: 's', pal: 'period', lo: 0, hi: 18, ticks: [0, 3, 5, 7, 9, 12, 15], particles: null, alpha: 0.85 },
+  { id: 'hs', topic: 'waves', name: 'Waves', icon: '〰', fields: ['hs'], val: (h) => h, unit: 'm', pal: 'waves', lo: 0, hi: 10, ticks: [0, 0.5, 1, 2, 3, 4, 6], particles: 'waves', alpha: 0.85 },
+  { id: 'swell', topic: 'waves', name: 'Swell', icon: '🌀', fields: ['swell'], val: (h) => h, unit: 'm', pal: 'waves', lo: 0, hi: 10, ticks: [0, 0.5, 1, 2, 3, 4], particles: 'waves', alpha: 0.85 },
+  { id: 'tm', topic: 'waves', name: 'Wave period', icon: '⏱', fields: ['tm'], val: (t) => t, unit: 's', pal: 'period', lo: 0, hi: 18, ticks: [0, 3, 5, 7, 9, 12, 15], particles: 'waves', alpha: 0.85 },
 ];
 for (const L of LAYERS) L.L = makeLut(PALS[L.pal], L.lo, L.hi);
 const TOPICS = { weather: 'Weather', current: 'Current', waves: 'Waves' };
@@ -400,7 +408,7 @@ async function gunzip(buf) {
 function loadFrame(field, t, scale) {
   const key = `${field}@${t}`;
   if (frameCache.has(key)) { const v = frameCache.get(key); frameCache.delete(key); frameCache.set(key, v); return v; }
-  const p = fetch(`data/f/${field}/${t}.bin.gz`).then((r) => { if (!r.ok) throw new Error(r.status); return r.arrayBuffer(); })
+  const p = fetch(`${DATA}/f/${field}/${t}.bin.gz`).then((r) => { if (!r.ok) throw new Error(r.status); return r.arrayBuffer(); })
     .then(gunzip).then((ab) => {
       const q = new Int16Array(ab), a = new Float32Array(q.length);
       for (let i = 0; i < q.length; i++) a[i] = q[i] === -32768 ? NaN : q[i] * scale;
@@ -481,10 +489,43 @@ async function drawColor() {
 }
 
 // ---- particles: wind on weather layers, current on the current layer
-const particleLayer = () => { const k = curLayer().particles; return k ? layerById(k) : null; };
+const WAVE_PL = { id: 'waves', topic: 'waves', fields: ['hs'] };
+const particleLayer = () => { const k = curLayer().particles; return k ? (k === 'waves' ? WAVE_PL : layerById(k)) : null; };
+const nearestVal = (g, A, lat, lon) => {
+  const x = Math.round((lon - g.lon0) / g.dlon), y = Math.round((lat - g.lat0) / g.dlat);
+  return x < 0 || y < 0 || x >= g.nx || y >= g.ny ? NaN : A[y * g.nx + x];
+};
+// the frames of some fields of one source at time t: {g, <field>: Float32Array}; missing fields are left out
+async function topicFrames(topic, fields, t) {
+  const src = S.LJ && S.LJ[topic], res = {};
+  if (!src || !src.fields || !src.grid) return res;
+  res.g = src.grid;
+  await Promise.all(fields.map(async (f) => {
+    const fi = src.fields[f]; if (!fi || !(fi.times || src.times).includes(t)) return;
+    const a = await loadFrame(f, t, fi.scale); if (a) res[f] = a;
+  }));
+  return res;
+}
+// wave ripples: travel direction (unit vector), height and period per screen cell
+async function buildWaveField(t) {
+  const v = await topicFrames('waves', ['hs', 'tm', 'wd'], t); if (!v.hs) return null;
+  const co = S.D && S.D.waves, ci = co ? co.idx.get(t) : undefined;
+  if (!v.wd && ci === undefined) return null;
+  const ax = screenAxes(FSTEP), N = ax.W * ax.H, U = new Float32Array(N), V = new Float32Array(N), Hh = new Float32Array(N), T = new Float32Array(N);
+  for (let j = 0; j < ax.H; j++) for (let i = 0; i < ax.W; i++) {
+    const k = j * ax.W + i, lat = ax.lats[j], lon = ax.lons[i], h = sampleGrid(v.g, v.hs, lat, lon);
+    U[k] = NaN; if (!(h > 0.05)) continue;
+    // wave direction = where the waves come FROM (full-res frame; older updates only have the coarse grid)
+    const from = v.wd ? nearestVal(v.g, v.wd, lat, lon) : bearingOf(bil(co.grid, co.DX[ci], lat, lon), bil(co.grid, co.DY[ci], lat, lon));
+    if (!(from === from)) continue;
+    const to = (from + 180) * RAD; U[k] = Math.sin(to); V[k] = Math.cos(to); Hh[k] = h; T[k] = v.tm ? sampleGrid(v.g, v.tm, lat, lon) : 5;
+  }
+  return { kind: 'waves', W: ax.W, H: ax.H, U, V, Hh, T };
+}
 const FSTEP = 6;
 async function buildField() {
   const P = particleLayer(), t = S.times[S.ti];
+  if (P && P.id === 'waves') { const f = S.ly.particles ? await buildWaveField(t) : null; if (t === S.times[S.ti]) S.field = f; return; }
   const data = P && S.ly.particles ? await layerArrays(P, t) : null;
   if (!data) { S.field = null; return; }
   const { g, arrs } = data, ax = screenAxes(FSTEP), U = new Float32Array(ax.W * ax.H), V = new Float32Array(ax.W * ax.H);
@@ -494,19 +535,21 @@ async function buildField() {
   // speed in px per frame: wind 0.075 px per knot, current 1.4 px per knot (currents are ~15x slower)
   S.field = { W: ax.W, H: ax.H, U, V, pk: P.id === 'current' ? 1.4 : 0.075 };
 }
-let parts = [], animId = null, moving = false;
+let parts = [], animId = null, moving = false, partWaves = false;
 function resetParticles() {
-  const sz = map.getSize(), n = Math.round(Math.min(4500, (sz.x * sz.y) / 380));
+  partWaves = !!(particleLayer() && particleLayer().id === 'waves');
+  const sz = map.getSize(), n = Math.round(partWaves ? Math.min(1400, (sz.x * sz.y) / 1500) : Math.min(4500, (sz.x * sz.y) / 380));
   parts = Array.from({ length: n }, () => spawn({}, sz));
   const o = CV.part; o.ctx.clearRect(0, 0, sz.x, sz.y);
 }
-function spawn(p, sz) { p.x = Math.random() * sz.x; p.y = Math.random() * sz.y; p.age = Math.floor(Math.random() * 80); p.max = 60 + Math.random() * 60; return p; }
+function spawn(p, sz) { p.x = Math.random() * sz.x; p.y = Math.random() * sz.y; p.age = Math.floor(Math.random() * 80); p.max = partWaves ? 90 + Math.random() * 80 : 60 + Math.random() * 60; return p; }
 function frame() {
   animId = requestAnimationFrame(frame);
   const o = CV.part, ctx = o.ctx, sz = map.getSize(), f = S.field;
   if (moving) return;
   if (!S.ly.particles || !f) { if (o.dirty) { ctx.clearRect(0, 0, sz.x, sz.y); o.dirty = false; } return; }
   o.dirty = true;
+  if (f.kind === 'waves') { drawRipples(ctx, sz, f); return; }
   ctx.globalCompositeOperation = 'destination-in'; ctx.fillStyle = 'rgba(0,0,0,0.92)'; ctx.fillRect(0, 0, sz.x, sz.y);
   ctx.globalCompositeOperation = 'source-over';
   ctx.beginPath();
@@ -518,6 +561,27 @@ function frame() {
     ctx.moveTo(p.x, p.y); ctx.lineTo(nx, ny); p.x = nx; p.y = ny;
   }
   ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = 1.1; ctx.stroke();
+}
+
+// wave ripples: short curved crests, two per wave train, moving the way the waves travel
+function drawRipples(ctx, sz, f) {
+  ctx.clearRect(0, 0, sz.x, sz.y);
+  const paths = [new Path2D(), new Path2D(), new Path2D(), new Path2D()];
+  for (const p of parts) {
+    const i = Math.round(p.x / FSTEP), j = Math.round(p.y / FSTEP), k = j * f.W + i;
+    if (i < 0 || j < 0 || i >= f.W || j >= f.H || !(f.U[k] === f.U[k]) || ++p.age > p.max) { spawn(p, sz); p.age = 0; continue; }
+    const dx = f.U[k], dy = -f.V[k], h = f.Hh[k], sp = 0.12 + 0.035 * (f.T[k] || 5); // longer period = faster waves
+    p.x += dx * sp; p.y += dy * sp;
+    const a = Math.sin((Math.PI * p.age) / p.max), path = paths[Math.min(3, Math.floor(a * 4))];
+    const len = Math.min(26, 7 + 6 * h), bow = len * 0.22, px = -dy, py = dx;
+    for (let r = 0; r < 2; r++) {
+      const cx = p.x - dx * r * 6, cy = p.y - dy * r * 6, l = (len * (1 - r * 0.3)) / 2;
+      path.moveTo(cx - px * l - dx * bow, cy - py * l - dy * bow);
+      path.quadraticCurveTo(cx + dx * bow, cy + dy * bow, cx + px * l - dx * bow, cy + py * l - dy * bow);
+    }
+  }
+  ctx.lineWidth = 1.4; ctx.lineCap = 'round';
+  paths.forEach((pa, b) => { ctx.strokeStyle = `rgba(255,255,255,${0.12 + b * 0.22})`; ctx.stroke(pa); });
 }
 
 // small arrow (used by the chart)
@@ -558,7 +622,7 @@ function renderMenu() {
   box.innerHTML = `<div class="tabs">${Object.entries(TOPICS).map(([k, n]) => `<button class="tab ${L.topic === k ? 'on' : ''}" data-topic="${k}">${n}</button>`).join('')}</div>
     <div class="lylist">${LAYERS.filter((l) => l.topic === L.topic).map((l) => `<button class="ly ${l.id === L.id ? 'on' : ''}" data-ly="${l.id}" ${avail(l) ? '' : 'disabled title="Not in this update"'}><span>${l.icon}</span>${l.name}</button>`).join('')}</div>
     <div class="card-title">Overlays</div>
-    <label><input type="checkbox" id="ov_particles" ${S.ly.particles ? 'checked' : ''}> Moving ${L.particles === 'current' ? 'current' : 'wind'} particles</label>
+    <label><input type="checkbox" id="ov_particles" ${S.ly.particles ? 'checked' : ''}> ${L.particles === 'waves' ? 'Moving wave ripples' : `Moving ${L.particles === 'current' ? 'current' : 'wind'} particles`}</label>
     ${Object.entries(OVERLAYS).map(([k, o]) => `<label title="${o.title}"><input type="checkbox" id="ov_${k}" ${S.ly[k] ? 'checked' : ''}> ${o.name}</label>`).join('')}
     <div class="card-title">Background</div>
     <select id="baseSel">${Object.entries(BASE_NAMES).map(([k, n]) => `<option value="${k}" ${S.base === k ? 'selected' : ''}>${n}</option>`).join('')}</select>`;
@@ -606,6 +670,7 @@ function setTime(i) {
   $('tLabel').textContent = tf(F.full, S.times[S.ti]);
   redrawMap();
   if (S.sel) { drawChart(); drawCompass(); renderWins(); }
+  updateBoat(); drawRouteChart();
 }
 function buildTimebar() {
   const sl = $('slider'), n = S.times.length;
@@ -628,7 +693,7 @@ document.addEventListener('keydown', (e) => {
   if (e.target.matches('input[type=text],input[type=number],textarea')) return;
   if (e.key === 'ArrowRight') setTime(S.ti + 1);
   if (e.key === 'ArrowLeft') setTime(S.ti - 1);
-  if (e.key === 'Escape') closePanel('point');
+  if (e.key === 'Escape') { closePanel('point'); closePanel('routeP'); }
 });
 
 // ------------------------------------------------------------------ status bar
@@ -668,16 +733,18 @@ function openPoint(lat, lon, spotId) {
   if (pos.wadden) notes.push('current from the fine Wadden grid (~670 m)');
   $('pSub').textContent = notes.join(' · ');
   $('btnSaveSpot').classList.toggle('hidden', !!spot);
-  $('point').classList.remove('hidden');
+  $('point').classList.remove('hidden'); $('routeP').classList.add('hidden');
   renderSpotCfg();
   drawChart();
 }
 function closePanel(id) {
   $(id).classList.add('hidden');
   if (id === 'point') { S.sel = null; if (selMarker) { map.removeLayer(selMarker); selMarker = null; } }
+  if (id === 'routeP') setRouteHover(null);
+  if (id === 'route') setDrawing(false);
 }
 document.querySelectorAll('[data-close]').forEach((b) => b.addEventListener('click', () => closePanel(b.dataset.close)));
-map.on('click', (e) => { if (S.D) openPoint(e.latlng.lat, e.latlng.lng, null); });
+map.on('click', (e) => { if (RT.drawing) { addWaypoint(e.latlng); return; } if (S.D) openPoint(e.latlng.lat, e.latlng.lng, null); });
 
 const chart = { c: $('chart'), geo: null, hover: null };
 function drawChart() {
@@ -922,6 +989,364 @@ function drawCompass() {
     <div class="small muted">Ring = wind coming <i>from</i> that side: <span style="color:#22c55e">■ OK</span> <span style="color:#ef4444">■ offshore</span> <span style="color:#94a3b8">■ onshore</span>. White = wind, cyan = current at the map time.</div>`;
 }
 
+// ------------------------------------------------------------------ route planner
+// Click waypoints on the map, give a departure time and a speed over ground; the boat's position is known at
+// every moment, and wind, gusts, current and waves are sampled where the boat is at that time.
+const NM = 1.852;
+const RT = Object.assign({ pts: [], start: null, speed: 6 }, store.get('kf.route', {}));
+RT.drawing = false; RT.cache = null; RT.res = null;
+if (!RT.start) RT.start = Math.ceil(Date.now() / 3600000) * 3600;
+const POS = [[0, 40, 'No-go', 'rgba(239,68,68,0.22)'], [40, 70, 'Close-hauled', 'rgba(245,158,11,0.15)'], [70, 110, 'Beam reach', 'rgba(34,197,94,0.10)'],
+  [110, 150, 'Broad reach', 'rgba(34,197,94,0.18)'], [150, 180.01, 'Run', 'rgba(96,165,250,0.16)']];
+const pointOfSail = (a) => (POS.find((p) => Math.abs(a) < p[1]) || POS[4])[2];
+const signed180 = (a) => { const x = norm360(a); return x > 180 ? x - 360 : x; };
+const hmDur = (sec) => { const m = Math.round(sec / 60); return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, '0')}`; };
+const courseOf = (a, b) => norm360(Math.atan2((b[1] - a[1]) * 111.32 * Math.cos(((a[0] + b[0]) / 2) * RAD), (b[0] - a[0]) * 110.57) / RAD);
+const rtLayer = L.layerGroup().addTo(map);
+let rtLines = [], rtBoat = null, rtHoverMk = null;
+
+function saveRoute() { store.set('kf.route', { pts: RT.pts, start: RT.start, speed: RT.speed }); }
+function routeGeom() {
+  const p = RT.pts, cum = [0];
+  for (let i = 1; i < p.length; i++) cum.push(cum[i - 1] + kmBetween(p[i - 1][0], p[i - 1][1], p[i][0], p[i][1]) / NM);
+  return { p, cum, total: cum[cum.length - 1] || 0 };
+}
+function posAt(G, d) {
+  const p = G.p; let i = 1;
+  while (i < p.length - 1 && G.cum[i] < d) i++;
+  const a = p[i - 1], b = p[i], len = G.cum[i] - G.cum[i - 1], f = len > 0 ? Math.min(1, Math.max(0, (d - G.cum[i - 1]) / len)) : 0;
+  return { lat: a[0] + (b[0] - a[0]) * f, lon: a[1] + (b[1] - a[1]) * f, course: courseOf(a, b), leg: i };
+}
+const routeDur = (G) => (G.total / RT.speed) * 3600;
+
+// ---- map drawing
+function drawRouteMap() {
+  rtLayer.clearLayers(); rtLines = []; rtBoat = null; rtHoverMk = null;
+  const G = routeGeom(); if (!G.p.length) return;
+  if (G.p.length > 1) {
+    rtLines = [L.polyline(G.p, { color: '#000', weight: 7, opacity: 0.4, interactive: false }), L.polyline(G.p, { color: '#fbbf24', weight: 3, interactive: false })];
+    rtLines.forEach((l) => l.addTo(rtLayer));
+    const dur = routeDur(G), step = dur > 36 * 3600 ? 6 : dur > 12 * 3600 ? 3 : 1;
+    for (let t = Math.ceil(RT.start / 3600) * 3600; t < RT.start + dur; t += 3600) {
+      if (localHour(t) % step) continue;
+      const q = posAt(G, ((t - RT.start) / 3600) * RT.speed);
+      L.marker([q.lat, q.lon], { icon: L.divIcon({ className: 'rt-tick', html: `<i></i><span>${tf(F.hm, t)}</span>`, iconSize: [0, 0] }), interactive: false, keyboard: false }).addTo(rtLayer);
+    }
+  }
+  G.p.forEach((pt, i) => {
+    const cls = i === 0 ? 'start' : i === G.p.length - 1 ? 'end' : '';
+    const m = L.marker(pt, { draggable: true, title: 'Drag to move · right-click or long-press to remove', icon: L.divIcon({ className: 'rt-wp-icon', html: `<div class="rt-wp ${cls}">${i + 1}</div>`, iconSize: [22, 22] }) });
+    m.on('drag', (e) => { RT.pts[i] = [e.latlng.lat, e.latlng.lng]; rtLines.forEach((l) => l.setLatLngs(RT.pts)); });
+    m.on('dragend', () => { RT.pts[i] = RT.pts[i].map((v) => +v.toFixed(5)); routeChanged(); });
+    m.on('contextmenu', (e) => { L.DomEvent.preventDefault(e.originalEvent); RT.pts.splice(i, 1); routeChanged(); });
+    m.addTo(rtLayer);
+  });
+  updateBoat();
+}
+// boat at the map time
+function updateBoat() {
+  if (rtBoat) { rtLayer.removeLayer(rtBoat); rtBoat = null; }
+  const G = routeGeom(), t = S.times[S.ti]; if (G.p.length < 2 || !(t >= RT.start && t <= RT.start + routeDur(G))) return;
+  const q = posAt(G, ((t - RT.start) / 3600) * RT.speed);
+  rtBoat = L.marker([q.lat, q.lon], { interactive: false, keyboard: false, zIndexOffset: 500, icon: L.divIcon({ className: 'rt-boat-icon', iconSize: [0, 0],
+    html: `<svg class="rt-boat" viewBox="-10 -14 20 28" style="transform:translate(-50%,-50%) rotate(${q.course}deg)"><path d="M0,-13 C6,-5 6,6 4,12 L-4,12 C-6,6 -6,-5 0,-13Z" fill="#fff" stroke="#111" stroke-width="1.6"/></svg><span>${tf(F.hm, t)}</span>` }) }).addTo(rtLayer);
+}
+function setRouteHover(r) {
+  if (!r) { if (rtHoverMk) { rtLayer.removeLayer(rtHoverMk); rtHoverMk = null; } return; }
+  if (!rtHoverMk) rtHoverMk = L.circleMarker([r.lat, r.lon], { radius: 7, color: '#fff', weight: 2.5, fillColor: '#fbbf24', fillOpacity: 1, interactive: false }).addTo(rtLayer);
+  else rtHoverMk.setLatLng([r.lat, r.lon]);
+}
+
+// ---- editing
+function setDrawing(on) {
+  RT.drawing = !!on;
+  $('map').classList.toggle('rt-drawing', RT.drawing);
+  if (RT.drawing) map.doubleClickZoom.disable(); else map.doubleClickZoom.enable();
+  const b = $('rtDraw'); if (b) { b.textContent = RT.drawing ? '✎ Adding points: on' : '✎ Add points'; b.classList.toggle('ghost', !RT.drawing); }
+}
+function addWaypoint(ll) { RT.pts.push([+ll.lat.toFixed(5), +ll.lng.toFixed(5)]); routeChanged(); }
+function routeChanged() { saveRoute(); RT.cache = null; drawRouteMap(); renderRouteSummary(); scheduleCompute(); }
+function paramsChanged() { saveRoute(); drawRouteMap(); renderRouteSummary(); scheduleCompute(); }
+const toLocalInput = (sec) => {
+  const d = new Date(sec * 1000), z = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}T${z(d.getHours())}:${z(d.getMinutes())}`;
+};
+function openRoutePanel() {
+  $('spots').classList.add('hidden');
+  if (S.times.length && RT.start < S.times[0]) { RT.start = Math.ceil(Date.now() / 3600000) * 3600; saveRoute(); drawRouteMap(); }
+  $('rtStart').value = toLocalInput(RT.start); $('rtSpeed').value = RT.speed;
+  $('route').classList.remove('hidden'); setDrawing(true); renderRouteSummary();
+}
+$('btnRoute').addEventListener('click', () => ($('route').classList.contains('hidden') ? openRoutePanel() : closePanel('route')));
+$('rtDraw').addEventListener('click', () => setDrawing(!RT.drawing));
+$('rtUndo').addEventListener('click', () => { RT.pts.pop(); routeChanged(); });
+$('rtRev').addEventListener('click', () => { RT.pts.reverse(); routeChanged(); });
+$('rtClear').addEventListener('click', () => { if (RT.pts.length && confirm('Remove the whole route?')) { RT.pts = []; routeChanged(); closePanel('routeP'); } });
+$('rtStart').addEventListener('change', (e) => { const t = Date.parse(e.target.value); if (t) { RT.start = Math.round(t / 1000); paramsChanged(); } });
+$('rtNow').addEventListener('click', () => { RT.start = Math.round(Date.now() / 60000) * 60; $('rtStart').value = toLocalInput(RT.start); paramsChanged(); });
+$('rtMapT').addEventListener('click', () => { if (!S.times.length) return; RT.start = S.times[S.ti]; $('rtStart').value = toLocalInput(RT.start); paramsChanged(); });
+$('rtSpeed').addEventListener('change', (e) => { const v = +e.target.value; if (v > 0) { RT.speed = Math.min(60, v); paramsChanged(); } });
+$('rtChart').addEventListener('click', () => {
+  $('point').classList.add('hidden'); if (S.sel) closePanel('point');
+  $('routeP').classList.remove('hidden'); if (innerWidth < 760) closePanel('route');
+  drawRouteChart();
+});
+
+// ---- forecast along the route
+// The route is cut into stations (~400). Each forecast hour is sampled once at all stations (cached), so
+// changing the departure time or speed only needs the hours that are new.
+let rtTok = 0, rtTimer = null;
+function scheduleCompute() { clearTimeout(rtTimer); rtTimer = setTimeout(computeRoute, 250); }
+async function computeRoute() {
+  const tok = ++rtTok, G = routeGeom();
+  RT.res = null;
+  if (G.p.length < 2 || G.total <= 0 || !(RT.speed > 0) || !S.times.length) { renderRouteSummary(); drawRouteChart(); return; }
+  const key = JSON.stringify(RT.pts) + '|' + (S.LJ && S.LJ.generated) + '|' + (S.D && S.D.generated);
+  if (!RT.cache || RT.cache.key !== key) {
+    const ds = Math.max(0.05, G.total / 400), st = [];
+    for (let d = 0; d < G.total; d += ds) st.push(posAt(G, d));
+    st.push(posAt(G, G.total));
+    RT.cache = { key, ds, st, hours: new Map() };
+  }
+  const C = RT.cache, t1 = RT.start + routeDur(G), need = [];
+  for (let H = Math.floor(RT.start / 3600) * 3600; H <= t1 + 3600; H += 3600) if (S.times.includes(H) && !C.hours.has(H)) need.push(H);
+  for (let k = 0; k < need.length; k++) {
+    if (tok !== rtTok) return;
+    renderRouteSummary(`Loading the forecast along the route… ${k}/${need.length} h`);
+    C.hours.set(need[k], await sampleRouteHour(C.st, need[k]));
+  }
+  if (tok !== rtTok) return;
+  RT.res = routeTimeline(G, C);
+  renderRouteSummary(); drawRouteChart();
+}
+const isv = (v) => v === v;
+async function sampleRouteHour(st, H) {
+  const [w, c, v] = await Promise.all([topicFrames('weather', ['u10', 'v10', 'gust'], H), topicFrames('current', ['cu', 'cv'], H), topicFrames('waves', ['hs', 'swell', 'tm', 'wd'], H)]);
+  const n = st.length, o = {};
+  for (const k of ['wu', 'wv', 'gust', 'cu', 'cv', 'hs', 'sw', 'tm', 'dx', 'dy']) o[k] = new Float32Array(n).fill(NaN);
+  for (let i = 0; i < n; i++) {
+    const { lat, lon } = st[i];
+    if (w.u10 && w.v10) { o.wu[i] = sampleGrid(w.g, w.u10, lat, lon) * KN; o.wv[i] = sampleGrid(w.g, w.v10, lat, lon) * KN; }
+    if (w.gust) o.gust[i] = sampleGrid(w.g, w.gust, lat, lon) * KN;
+    if (c.cu && c.cv) { o.cu[i] = sampleGrid(c.g, c.cu, lat, lon) * KN; o.cv[i] = sampleGrid(c.g, c.cv, lat, lon) * KN; }
+    if (v.hs) o.hs[i] = sampleGrid(v.g, v.hs, lat, lon);
+    if (v.swell) o.sw[i] = sampleGrid(v.g, v.swell, lat, lon);
+    if (v.tm) o.tm[i] = sampleGrid(v.g, v.tm, lat, lon);
+    if (v.wd) { const d = nearestVal(v.g, v.wd, lat, lon); if (isv(d)) { o.dx[i] = Math.sin(d * RAD); o.dy[i] = Math.cos(d * RAD); } }
+    // gaps: fall back to the coarse point data (forecast.json, fine Wadden current)
+    if (!isv(o.wu[i]) || !isv(o.cu[i]) || !isv(o.hs[i]) || (o.hs[i] > 0 && !isv(o.dx[i]))) {
+      const r = S.D ? sampleAt(lat, lon, H) : {};
+      if (!isv(o.wu[i]) && Number.isFinite(r.ws)) { o.wu[i] = r.ws * Math.sin((r.wd + 180) * RAD); o.wv[i] = r.ws * Math.cos((r.wd + 180) * RAD); if (!isv(o.gust[i])) o.gust[i] = r.gust; }
+      if (!isv(o.cu[i]) && Number.isFinite(r.cs)) { o.cu[i] = r.cs * Math.sin(r.cd * RAD); o.cv[i] = r.cs * Math.cos(r.cd * RAD); }
+      if (!isv(o.hs[i]) && Number.isFinite(r.hs)) { o.hs[i] = r.hs; o.sw[i] = r.sw; o.tm[i] = r.tm; }
+      if (!isv(o.dx[i]) && Number.isFinite(r.vd)) { o.dx[i] = Math.sin(r.vd * RAD); o.dy[i] = Math.cos(r.vd * RAD); }
+    }
+  }
+  return o;
+}
+function routeTimeline(G, C) {
+  const t0 = RT.start, dur = routeDur(G), N = Math.max(2, Math.min(400, Math.round(dur / 60))), rows = [];
+  for (let k = 0; k <= N; k++) {
+    const t = t0 + (dur * k) / N, d = (G.total * k) / N, si = Math.min(C.st.length - 1, Math.round(d / C.ds)), q = posAt(G, d);
+    const H0 = Math.floor(t / 3600) * 3600, f = (t - H0) / 3600, A = C.hours.get(H0), B = C.hours.get(H0 + 3600);
+    const val = (key) => {
+      const a = A ? A[key][si] : NaN, b = B ? B[key][si] : NaN;
+      if (isv(a) && isv(b)) return a + (b - a) * f;
+      if (isv(a) && f <= 0.5) return a; if (isv(b) && f >= 0.5) return b; return NaN;
+    };
+    const r = { t, d, lat: q.lat, lon: q.lon, course: q.course, leg: q.leg, night: !isDay(t, q.lat, q.lon) };
+    const wu = val('wu'), wv = val('wv'), cu = val('cu'), cv = val('cv'), dx = val('dx'), dy = val('dy');
+    r.ws = Math.hypot(wu, wv); r.wd = norm360(bearingOf(wu, wv) + 180); r.gust = val('gust');
+    r.twa = signed180(r.wd - q.course);                         // + = wind over starboard
+    r.cs = Math.hypot(cu, cv); r.cdTo = bearingOf(cu, cv);
+    r.tca = angDiff(r.cdTo + 180, q.course);                     // like TWA: 0 = current from ahead (foul), 180 = from behind (fair)
+    r.along = r.cs * Math.cos((r.cdTo - q.course) * RAD);        // + = pushes you along your course
+    r.hs = val('hs'); r.sw = val('sw'); r.tm = val('tm');
+    r.vd = isv(dx) && isv(dy) ? bearingOf(dx, dy) : NaN; r.wa = signed180(r.vd - q.course);
+    rows.push(r);
+  }
+  return { rows, total: G.total, dur, cum: G.cum };
+}
+
+// ---- summary in the route panel
+function renderRouteSummary(msg) {
+  const el = $('rtSum'), G = routeGeom();
+  $('rtChart').disabled = G.p.length < 2;
+  if (G.p.length < 2) { el.innerHTML = `<p class="muted small">${G.p.length ? 'Now click the next point of your route.' : 'Click the map where you start.'}</p>`; return; }
+  const dur = routeDur(G);
+  let h = `<div class="rt-stats"><div><b>${G.total.toFixed(1)}</b> nm</div><div><b>${hmDur(dur)}</b> under way</div><div>Arrive <b>${tf(F.dayhm, RT.start + dur)}</b></div></div>`;
+  h += '<div class="rt-legs small">' + G.p.slice(1).map((p, i) => `<span>${i + 1}→${i + 2} <b>${fmt0(courseOf(G.p[i], p))}°</b> ${(G.cum[i + 1] - G.cum[i]).toFixed(1)} nm</span>`).join('') + '</div>';
+  if (msg) h += `<p class="muted small">${msg}<span class="progress"><span></span></span></p>`;
+  else if (RT.res) {
+    const rows = RT.res.rows, fin = rows.filter((r) => Number.isFinite(r.ws)), share = (f) => Math.round((100 * rows.filter(f).length) / rows.length);
+    const hrs = (f) => (rows.filter(f).length / rows.length) * dur / 3600;
+    const li = [];
+    if (fin.length < rows.length) li.push(`<span class="warn">⚠ ${100 - share((r) => Number.isFinite(r.ws))}% of the trip is outside the forecast</span>`);
+    if (fin.length) {
+      li.push(`🌬 Wind <b>${fmt0(Math.min(...fin.map((r) => r.ws)))}–${fmt0(Math.max(...fin.map((r) => r.ws)))} kn</b>, gusts up to <b>${fmt0(Math.max(...fin.map((r) => r.gust || 0)))} kn</b>`);
+      const ng = hrs((r) => Math.abs(r.twa) < 40);
+      li.push(ng > 0.05 ? `<span class="warn">⛔ ${hmDur(ng * 3600)} dead upwind (TWA &lt; 40°): you will have to tack</span>` : `⛵ Mostly ${pointOfSail(median(fin.map((r) => Math.abs(r.twa)))).toLowerCase()}`);
+    }
+    const cs = rows.filter((r) => Number.isFinite(r.along));
+    if (cs.length) { const a = cs.reduce((s, r) => s + r.along, 0) / cs.length; li.push(`🌊 Current on average <b style="color:${a >= 0 ? '#4ade80' : '#f87171'}">${a >= 0 ? '+' : ''}${fmt1(a)} kn</b> ${a >= 0 ? 'with you' : 'against you'}`); }
+    const hs = rows.filter((r) => Number.isFinite(r.hs));
+    if (hs.length) li.push(`〰 Waves up to <b>${fmt1(Math.max(...hs.map((r) => r.hs)))} m</b>`);
+    h += `<div class="rt-facts">${li.map((x) => `<div>${x}</div>`).join('')}</div>`;
+  }
+  el.innerHTML = h;
+}
+const median = (a) => { const b = [...a].sort((x, y) => x - y); return b.length ? b[Math.floor(b.length / 2)] : NaN; };
+
+// ---- chart along the route
+const rchart = { c: $('rchart'), geo: null, hover: null };
+function drawRouteChart() {
+  if ($('routeP').classList.contains('hidden')) return;
+  const c = rchart.c, dpr = Math.min(2, window.devicePixelRatio || 1), W = c.clientWidth, H = c.clientHeight;
+  c.width = W * dpr; c.height = H * dpr;
+  const ctx = c.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, W, H);
+  const css = getComputedStyle(document.documentElement), col = (n) => css.getPropertyValue(n).trim();
+  const res = RT.res, G = routeGeom();
+  $('rpSub').textContent = G.p.length > 1 ? `${G.total.toFixed(1)} nm at ${RT.speed} kn · ${tf(F.dayhm, RT.start)} → ${tf(F.dayhm, RT.start + routeDur(G))}` : '';
+  if (!res) {
+    rchart.geo = null; ctx.fillStyle = col('--muted'); ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(G.p.length < 2 ? 'Draw a route with at least two points (Route button, then click the map).' : 'Loading the forecast along the route…', W / 2, H / 2); return;
+  }
+  const rows = res.rows, n = rows.length, t0 = rows[0].t, t1 = rows[n - 1].t;
+  const padL = 40, padR = 10, top = 24, bottom = 20, gap = 14, xL = padL, xR = W - padR;
+  const X = (t) => xL + ((t - t0) / (t1 - t0)) * (xR - xL);
+  const spec = [['wind', 1.3], ['angle', 1.2], ['cur', 0.95], ['wave', 0.95]];
+  const tot = spec.reduce((s, p) => s + p[1], 0), avail = H - top - bottom - gap * (spec.length - 1), P = {};
+  let y = top; for (const [k, w] of spec) { const h = (avail * w) / tot; P[k] = { y0: y, y1: y + h, h }; y += h + gap; }
+  rchart.geo = { padL, padR, W, n };
+  const half = Math.max(0.6, (xR - xL) / (n - 1) / 2 + 0.4), STRIP = 18;
+  ctx.font = '10px sans-serif'; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  for (const k in P) { ctx.fillStyle = 'rgba(255,255,255,0.035)'; ctx.fillRect(xL, P[k].y0, xR - xL, P[k].h); }
+  // points of sail behind the angle plot
+  const pa = P.angle, YA = (a) => pa.y0 + 16 + (a / 180) * (pa.h - 16);
+  for (const [a0, a1, name, fill] of POS) {
+    const ya = YA(a0), yb = YA(Math.min(180, a1)); ctx.fillStyle = fill; ctx.fillRect(xL, ya, xR - xL, yb - ya);
+    ctx.fillStyle = 'rgba(255,255,255,0.5)'; ctx.textAlign = 'right'; ctx.fillText(name, xR - 4, (ya + yb) / 2 + 3);
+  }
+  // night and "no forecast"
+  rows.forEach((r) => {
+    const x = X(r.t);
+    if (r.night) { ctx.fillStyle = 'rgba(0,0,0,0.32)'; for (const k in P) ctx.fillRect(x - half, P[k].y0, half * 2, P[k].h); }
+    if (!Number.isFinite(r.ws)) { ctx.fillStyle = 'rgba(148,163,184,0.22)'; for (const k in P) ctx.fillRect(x - half, P[k].y0, half * 2, P[k].h); }
+  });
+  // axes: time below, distance above, faint vertical grid
+  const tzOff = (localHour(t0) - new Date(t0 * 1000).getUTCHours() + 24) % 24, pxH = (xR - xL) / ((t1 - t0) / 3600);
+  const stepH = [0.25, 0.5, 1, 2, 3, 6, 12, 24].find((s) => s * pxH >= 56) || 24;
+  ctx.textAlign = 'center';
+  for (let hh = Math.ceil((t0 / 3600 + tzOff) / stepH) * stepH - tzOff; hh * 3600 <= t1; hh += stepH) {
+    const t = Math.round(hh * 3600), x = X(t), midnight = localHour(t) === 0 && t % 3600 === 0;
+    ctx.strokeStyle = midnight ? 'rgba(255,255,255,0.28)' : 'rgba(255,255,255,0.07)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, H - bottom); ctx.stroke();
+    ctx.fillStyle = midnight ? col('--text') : col('--muted'); ctx.fillText(midnight ? tf(F.day, t) : tf(F.hm, t), x, H - 6);
+  }
+  const pxNm = (xR - xL) / res.total, stepNm = [0.25, 0.5, 1, 2, 5, 10, 20, 50, 100].find((s) => s * pxNm >= 52) || 100;
+  ctx.fillStyle = col('--muted');
+  for (let d = 0; d <= res.total + 1e-9; d += stepNm) ctx.fillText(`${+d.toFixed(2)} nm`, X(t0 + (d / RT.speed) * 3600), 10);
+  // waypoints
+  res.cum.forEach((d, i) => {
+    const x = X(t0 + (d / RT.speed) * 3600);
+    ctx.setLineDash([2, 3]); ctx.strokeStyle = 'rgba(251,191,36,0.6)'; ctx.beginPath(); ctx.moveTo(x, 14); ctx.lineTo(x, H - bottom); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = '#fbbf24'; ctx.beginPath(); ctx.arc(Math.min(Math.max(x, xL + 7), xR - 7), 19, 7, 0, 7); ctx.fill();
+    ctx.fillStyle = '#111'; ctx.font = '700 9px sans-serif'; ctx.fillText(i + 1, Math.min(Math.max(x, xL + 7), xR - 7), 22); ctx.font = '10px sans-serif';
+  });
+  const yTicks = (p, Y, max, step, fmt) => {
+    ctx.textAlign = 'right';
+    for (let v = 0; v <= max + 1e-9; v += step) {
+      const yy = Y(v); ctx.strokeStyle = 'rgba(255,255,255,0.07)'; ctx.beginPath(); ctx.moveTo(xL, yy); ctx.lineTo(xR, yy); ctx.stroke();
+      ctx.fillStyle = col('--muted'); ctx.fillText(fmt(v), xL - 4, yy + 3);
+    }
+  };
+  const line = (key, Y, color, width, dash) => {
+    ctx.beginPath(); let on = false;
+    rows.forEach((r) => { const v = r[key]; if (!Number.isFinite(v)) { on = false; return; } const x = X(r.t), yy = Y(v); if (on) ctx.lineTo(x, yy); else ctx.moveTo(x, yy); on = true; });
+    ctx.setLineDash(dash || []); ctx.strokeStyle = color; ctx.lineWidth = width; ctx.stroke(); ctx.setLineDash([]);
+  };
+  const bars = (key, Y, p, colorOf) => rows.forEach((r) => { const v = r[key]; if (!(v > 0)) return; ctx.fillStyle = colorOf(r); ctx.fillRect(X(r.t) - half, Y(v), half * 2, p.y1 - Y(v)); });
+  const nice = (v, step, min) => Math.max(min, Math.ceil(v / step) * step);
+  // wind + gusts
+  const pw = P.wind, maxKn = nice(Math.max(0, ...rows.map((r) => Math.max(r.gust || 0, r.ws || 0))) + 2, 5, 15), YW = (v) => pw.y1 - (v / maxKn) * (pw.h - STRIP);
+  yTicks(pw, YW, maxKn, maxKn > 40 ? 10 : 5, (v) => v);
+  bars('ws', YW, pw, (r) => windColor(r.ws, 0.6));
+  line('gust', YW, col('--gust'), 1.6, [5, 3]); line('ws', YW, '#fff', 2);
+  // angles to the course
+  yTicks(pa, (v) => YA(v), 180, 90, (v) => v + '°');
+  for (let i = 1; i < n; i++) {
+    const a = rows[i - 1], b = rows[i]; if (!Number.isFinite(a.twa) || !Number.isFinite(b.twa)) continue;
+    ctx.strokeStyle = b.twa >= 0 ? '#4ade80' : '#f87171'; ctx.lineWidth = 2.6;
+    ctx.beginPath(); ctx.moveTo(X(a.t), YA(Math.abs(a.twa))); ctx.lineTo(X(b.t), YA(Math.abs(b.twa))); ctx.stroke();
+  }
+  line('tca', (v) => YA(v), '#22d3ee', 1.6, [4, 3]);
+  // current: bars green when it pushes you along, red when against (stronger colour = more straight along/against)
+  const pc = P.cur, maxC = nice(Math.max(0, ...rows.map((r) => r.cs || 0)) + 0.1, 0.5, 1), YC = (v) => pc.y1 - (v / maxC) * (pc.h - STRIP);
+  yTicks(pc, YC, maxC, maxC > 2 ? 1 : 0.5, (v) => v.toFixed(1));
+  bars('cs', YC, pc, (r) => { const f = r.along / Math.max(r.cs, 1e-6), a = 0.2 + 0.5 * Math.abs(f); return f >= 0 ? `rgba(74,222,128,${a})` : `rgba(248,113,113,${a})`; });
+  line('cs', YC, '#22d3ee', 1.8);
+  // waves
+  const pv = P.wave, maxH = nice(Math.max(0, ...rows.map((r) => Math.max(r.hs || 0, r.sw || 0))) + 0.2, 0.5, 1), YV = (v) => pv.y1 - (v / maxH) * (pv.h - STRIP), WL = layerById('hs').L;
+  yTicks(pv, YV, maxH, maxH > 3 ? 1 : 0.5, (v) => v.toFixed(1));
+  bars('hs', YV, pv, (r) => { const i = lutAt(WL, r.hs); return `rgba(${WL.lut[i]},${WL.lut[i + 1]},${WL.lut[i + 2]},0.6)`; });
+  line('sw', YV, col('--swell'), 1.5, [4, 3]); line('hs', YV, '#fff', 1.8);
+  // titles + arrows as seen from the boat (↑ = your course)
+  const title = (p, txt) => { ctx.font = '600 11px sans-serif'; ctx.textAlign = 'left'; const w = ctx.measureText(txt).width; ctx.fillStyle = 'rgba(15,23,32,0.75)'; ctx.fillRect(xL + 2, p.y0 + 2, w + 10, 15); ctx.fillStyle = col('--text'); ctx.fillText(txt, xL + 7, p.y0 + 13); ctx.font = '10px sans-serif'; return xL + w + 24; };
+  const ax = { wind: title(pw, 'Wind & gusts, kn'), cur: title(pc, 'Current, kn'), wave: title(pv, 'Waves, m') };
+  title(pa, 'Angle to your course · 0° = from ahead');
+  for (const [k, p] of [['wind', pw], ['cur', pc], ['wave', pv]]) {
+    for (let x = ax[k]; x < xR - 8; x += 40) {
+      const r = rows[Math.round(((x - xL) / (xR - xL)) * (n - 1))], yy = p.y0 + 9;
+      if (k === 'wind' && Number.isFinite(r.ws)) arrow(ctx, x, yy, r.wd + 180 - r.course, 14, windColor(r.ws), 1.8);
+      if (k === 'cur' && r.cs > 0.05) arrow(ctx, x, yy, r.cdTo - r.course, 6 + 8 * Math.min(1, r.cs / 1.5), r.along >= 0 ? '#4ade80' : '#f87171', 1.7);
+      if (k === 'wave' && r.hs > 0.05 && Number.isFinite(r.vd)) arrow(ctx, x, yy, r.vd + 180 - r.course, 6 + 8 * Math.min(1, r.hs / 2), '#fff', 1.6);
+    }
+  }
+  // map time, now, hover
+  const vline = (t, color, dash, w) => { const x = X(t); ctx.setLineDash(dash); ctx.strokeStyle = color; ctx.lineWidth = w; ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, H - bottom); ctx.stroke(); ctx.setLineDash([]); };
+  const ts = S.times[S.ti]; if (ts >= t0 && ts <= t1) vline(ts, '#fff', [], 1.5);
+  const now = Date.now() / 1000; if (now >= t0 && now <= t1) vline(now, 'rgba(239,68,68,0.9)', [2, 2], 1.2);
+  if (rchart.hover != null) vline(rows[rchart.hover].t, 'rgba(255,255,255,0.55)', [], 1);
+  $('rchartKey').innerHTML = [
+    '<span><i style="background:#fff"></i>Wind</span>', '<span><i class="dash"></i>Gusts</span>',
+    '<span><i style="background:#4ade80"></i>TWA, wind over starboard</span>', '<span><i style="background:#f87171"></i>TWA, wind over port</span>',
+    '<span><i style="background:#22d3ee"></i>Current speed / TCA (dashed)</span>', '<span><i style="background:var(--swell)"></i>Swell</span>',
+    '<span><i style="background:rgba(0,0,0,.6)"></i>Night</span>', '<span><i style="background:rgba(148,163,184,.5)"></i>No forecast</span>',
+    '<span>Arrows: how wind, current and waves move as seen from the boat; ↑ = along your course, ↓ = against you. Tap the chart to move the map and the boat to that time.</span>',
+  ].join('');
+}
+function rIndexAt(e) {
+  const g = rchart.geo; if (!g) return null;
+  const rect = rchart.c.getBoundingClientRect(), f = (e.clientX - rect.left - g.padL) / (g.W - g.padL - g.padR);
+  if (f < -0.02 || f > 1.02) return null;
+  return Math.max(0, Math.min(g.n - 1, Math.round(f * (g.n - 1))));
+}
+const side = (a) => (a >= 0 ? 'starboard' : 'port');
+rchart.c.addEventListener('pointermove', (e) => {
+  const i = rIndexAt(e), tip = $('rchartTip'); rchart.hover = i; drawRouteChart();
+  if (i == null || !RT.res) { tip.classList.add('hidden'); setRouteHover(null); return; }
+  const r = RT.res.rows[i]; setRouteHover(r);
+  const L2 = [`<b>${tf(F.full, r.t)}</b>${r.night ? ' <span class="muted">(dark)</span>' : ''}`,
+    `<span class="muted">${fmt1(r.d)} nm from the start · course ${fmt0(r.course)}° · leg ${r.leg}→${r.leg + 1}</span>`];
+  if (Number.isFinite(r.ws)) L2.push(`🌬 Wind <b>${fmt0(r.ws)} kn</b> from ${compass(r.wd)} (${fmt0(r.wd)}°), gusts ${fmt0(r.gust)} kn<br>&nbsp;&nbsp;&nbsp;&nbsp;TWA <b style="color:${r.twa >= 0 ? '#4ade80' : '#f87171'}">${fmt0(Math.abs(r.twa))}° ${side(r.twa)}</b> → ${pointOfSail(r.twa)}`);
+  else L2.push('<span class="muted">No wind forecast for this time</span>');
+  if (Number.isFinite(r.cs)) L2.push(`🌊 Current <b>${fmt1(r.cs)} kn</b> toward ${compass(r.cdTo)} · TCA ${fmt0(r.tca)}°<br>&nbsp;&nbsp;&nbsp;&nbsp;<b style="color:${r.along >= 0 ? '#4ade80' : '#f87171'}">${r.along >= 0 ? '+' : ''}${fmt1(r.along)} kn</b> along your course, ${fmt1(Math.abs(r.cs * Math.sin((r.cdTo - r.course) * RAD)))} kn sideways`);
+  if (Number.isFinite(r.hs)) L2.push(`〰 Waves <b>${fmt1(r.hs)} m</b>, ${fmt1(r.tm)} s, swell ${fmt1(r.sw)} m` + (Number.isFinite(r.wa) ? `<br>&nbsp;&nbsp;&nbsp;&nbsp;from ${compass(r.vd)}: ${Math.abs(r.wa) < 45 ? 'head seas' : Math.abs(r.wa) < 135 ? `beam seas (${side(r.wa)})` : 'following seas'}` : ''));
+  tip.innerHTML = L2.join('<br>'); tip.classList.remove('hidden');
+  const rect = rchart.c.getBoundingClientRect(), x = e.clientX - rect.left;
+  tip.style.top = '30px'; tip.style.left = (x + 14 + tip.offsetWidth > rect.width ? Math.max(4, x - tip.offsetWidth - 14) : x + 14) + 'px';
+});
+rchart.c.addEventListener('pointerleave', () => { rchart.hover = null; $('rchartTip').classList.add('hidden'); setRouteHover(null); drawRouteChart(); });
+rchart.c.addEventListener('click', (e) => {
+  const i = rIndexAt(e); if (i == null || !RT.res) return;
+  const t = RT.res.rows[i].t; let k = 0, best = Infinity;
+  S.times.forEach((x, j) => { if (Math.abs(x - t) < best) { best = Math.abs(x - t); k = j; } });
+  setTime(k);
+});
+document.querySelector('[data-open-route]').addEventListener('click', openRoutePanel);
+window.addEventListener('resize', drawRouteChart);
+drawRouteMap();
+
 // ------------------------------------------------------------------ legend
 function drawLegend() {
   const L = curLayer(), c = $('legendCanvas'), ctx = c.getContext('2d');
@@ -1023,7 +1448,7 @@ function checkAlert() {
 // ------------------------------------------------------------------ boot
 async function loadWadden() {
   try {
-    const r = await fetch(`data/wadden.json?v=${Date.now()}`, { cache: 'no-store' }); if (!r.ok) return;
+    const r = await fetch(`${DATA}/wadden.json?v=${Date.now()}`, { cache: 'no-store' }); if (!r.ok) return;
     const c = (await r.json()).current; if (!c) return;
     c.idx = new Map(c.times.map((t, i) => [t, i]));
     c.U = toFrames(c.u, 0.01 * KN_PER_MS); c.V = toFrames(c.v, 0.01 * KN_PER_MS); delete c.u; delete c.v;
@@ -1033,10 +1458,10 @@ async function loadWadden() {
   } catch { /* optional file */ }
 }
 async function fetchData() {
-  try { const r = await fetch(`data/forecast.json?v=${Date.now()}`, { cache: 'no-store' }); if (!r.ok) return null; return await r.json(); } catch { return null; }
+  try { const r = await fetch(`${DATA}/forecast.json?v=${Date.now()}`, { cache: 'no-store' }); if (!r.ok) return null; return await r.json(); } catch { return null; }
 }
 async function fetchLayers() {
-  try { const r = await fetch(`data/layers.json?v=${Date.now()}`, { cache: 'no-store' }); if (!r.ok) return null; return await r.json(); } catch { return null; }
+  try { const r = await fetch(`${DATA}/layers.json?v=${Date.now()}`, { cache: 'no-store' }); if (!r.ok) return null; return await r.json(); } catch { return null; }
 }
 async function applyData(D) {
   const keepT = S.times[S.ti];
@@ -1058,6 +1483,7 @@ async function applyData(D) {
   if (S.sel) openPoint(S.sel.lat, S.sel.lon, S.sel.spotId);
   checkAlert();
   loadWadden();
+  RT.cache = null; drawRouteMap(); scheduleCompute();
 }
 async function boot() {
   for (const k of Object.keys(OVERLAYS)) if (S.ly[k]) setOverlay(k, true);

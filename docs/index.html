@@ -14,6 +14,7 @@
   <div class="brand">Kite Forecast <span>NL coast</span></div>
   <div id="status" class="status">Loading data…</div>
   <button id="btnUpdate" class="btn" title="Fetch new model data now">⟳ Update now</button>
+  <button id="btnRoute" class="btn ghost" title="Plan a route and see the conditions along it">Route</button>
   <button id="btnSpots" class="btn ghost" title="Kite spots and alerts">Spots</button>
 </header>
 
@@ -48,6 +49,36 @@
     <button class="btn small" id="btnImport">Load from text</button>
   </details>
 </aside>
+
+<aside id="route" class="panel hidden">
+  <div class="panel-head"><b>Route planner</b><button class="x" data-close="route">×</button></div>
+  <p class="muted small">Click the map to add points. Drag a point to move it; right-click or long-press it to remove it.</p>
+  <div class="rt-form">
+    <label>Departure <input type="datetime-local" id="rtStart"></label>
+    <div class="rt-quick"><button class="btn small ghost" id="rtNow">Now</button><button class="btn small ghost" id="rtMapT" title="Use the time shown on the map">Map time</button></div>
+    <label>Speed over ground (kn) <input type="number" id="rtSpeed" min="0.5" max="60" step="0.5"></label>
+  </div>
+  <div class="rt-btns">
+    <button class="btn small" id="rtDraw">✎ Add points</button>
+    <button class="btn small ghost" id="rtUndo" title="Remove the last point">↶ Undo</button>
+    <button class="btn small ghost" id="rtRev" title="Sail the route the other way">⇄ Reverse</button>
+    <button class="btn small danger" id="rtClear">Clear</button>
+  </div>
+  <div id="rtSum"></div>
+  <button class="btn" id="rtChart" style="width:100%;margin-top:8px">📈 Conditions along the route</button>
+</aside>
+
+<section id="routeP" class="panel bottom hidden">
+  <div class="panel-head">
+    <div><b>Conditions along your route</b> <span id="rpSub" class="muted small"></span></div>
+    <div class="head-btns"><button class="btn small ghost" data-open-route>Edit route</button><button class="x" data-close="routeP">×</button></div>
+  </div>
+  <div class="chart-wrap">
+    <canvas id="rchart"></canvas>
+    <div id="rchartTip" class="tip hidden"></div>
+  </div>
+  <div id="rchartKey" class="key small"></div>
+</section>
 
 <section id="point" class="panel bottom hidden">
   <div class="panel-head">
