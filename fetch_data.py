@@ -402,18 +402,20 @@ def fetch_marine_frames(out):
     info = {}
     for kind, source, fields, n, chunk, label in (
         ("current", CURRENT_SOURCE, CURRENT_FIELDS, CURRENT_FINE_N, 24, "Rijkswaterstaat DCSM7/ZUNO (Matroos)"),
-        ("waves", WAVE_SOURCE, ["wave_height_hm0", "wave_period_tm10", "swellwave_height_hm0"], WAVES_FINE_N, 6,
+        ("waves", WAVE_SOURCE, ["wave_height_hm0", "wave_period_tm10", "swellwave_height_hm0", "wave_dir_th0"], WAVES_FINE_N, 6,
          "Rijkswaterstaat SWAN Kuststrook (Matroos)"),
     ):
         try:
             run, times, grid, f = fetch_matroos(source, fields, MARINE_BOX, n, chunk)
-            names = {"VELU": "cu", "VELV": "cv", "wave_height_hm0": "hs", "wave_period_tm10": "tm", "swellwave_height_hm0": "swell"}
+            names = {"VELU": "cu", "VELV": "cv", "wave_height_hm0": "hs", "wave_period_tm10": "tm",
+                     "swellwave_height_hm0": "swell", "wave_dir_th0": "wd"}
+            scales = {"wd": 0.1}   # wave direction (coming from, degrees) does not fit int16 at 0.01
             size = 0
             for fld, arr in f.items():
                 for i, t in enumerate(times):
-                    size += write_frame(out, names[fld], t, arr[i], 0.01)
+                    size += write_frame(out, names[fld], t, arr[i], scales.get(names[fld], 0.01))
             info[kind] = {"source": label, "run": run, "grid": grid, "times": times,
-                          "fields": {names[k]: {"scale": 0.01} for k in f}}
+                          "fields": {names[k]: {"scale": scales.get(names[k], 0.01)} for k in f}}
             log(f"{kind} frames: {len(times)} hours, {size / 1e6:.0f} MB")
         except Exception as e:  # noqa: BLE001
             log(f"!! {kind} frames failed: {e}")
