@@ -3,6 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Kite NL">
 <title>Kite Forecast NL</title>
 <meta name="theme-color" content="#0f1720">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 2 L28 14 L16 22 L4 14Z' fill='%2322c55e'/%3E%3Cpath d='M16 22 Q14 27 18 30' stroke='%2322c55e' stroke-width='2' fill='none'/%3E%3C/svg%3E">
@@ -11,15 +15,18 @@
 </head>
 <body>
 <header id="top">
-  <div class="brand">Kite Forecast <span>NL coast</span></div>
+  <div class="brand"><b class="logo">🪁</b><span class="bname">Kite Forecast</span> <span class="bsub">NL coast</span></div>
   <div id="status" class="status">Loading data…</div>
-  <button id="btnUpdate" class="btn" title="Fetch new model data now">⟳ Update now</button>
-  <button id="btnRoute" class="btn ghost" title="Plan a route and see the conditions along it">Route</button>
-  <button id="btnSpots" class="btn ghost" title="Kite spots and alerts">Spots</button>
+  <div class="topbtns">
+    <button id="btnUpdate" class="btn" title="Fetch new model data now"><span>⟳</span><span class="lbl"> Update</span></button>
+    <button id="btnRoute" class="btn ghost" title="Plan a route and see the conditions along it"><span>🧭</span><span class="lbl"> Route</span></button>
+    <button id="btnSpots" class="btn ghost" title="Kite spots and alerts"><span>🪁</span><span class="lbl"> Spots</span></button>
+  </div>
 </header>
 
 <div id="map"></div>
 
+<button id="btnLayers" class="layers-tab" title="Map layers"></button>
 <div id="layers" class="card">
   <div class="card-title">Layers</div>
   <label><input type="checkbox" id="lyColor" checked> Wind colours</label>
@@ -71,7 +78,7 @@
 <section id="routeP" class="panel bottom hidden">
   <div class="panel-head">
     <div><b>Conditions along your route</b> <span id="rpSub" class="muted small"></span></div>
-    <div class="head-btns"><button class="btn small ghost" data-open-route>Edit route</button><button class="x" data-close="routeP">×</button></div>
+    <div class="head-btns"><button class="btn small ghost" id="btnRExpand" title="Show more or less">⤡ Less</button><button class="btn small ghost" data-open-route>Edit</button><button class="x" data-close="routeP">×</button></div>
   </div>
   <div class="chart-wrap">
     <canvas id="rchart"></canvas>
@@ -85,9 +92,11 @@
     <div><b id="pTitle">Location</b> <span id="pSub" class="muted small"></span></div>
     <div class="head-btns">
       <button class="btn small" id="btnSaveSpot">Save as spot</button>
+      <button class="btn small ghost" id="btnPExpand" title="Show more or less">⤢ More</button>
       <button class="x" data-close="point">×</button>
     </div>
   </div>
+  <div id="pNow" class="pnow small"></div>
   <div class="chart-wrap">
     <canvas id="chart"></canvas>
     <div id="chartTip" class="tip hidden"></div>

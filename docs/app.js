@@ -619,7 +619,9 @@ map.on('move', () => {
 function renderMenu() {
   const L = curLayer(), box = $('layers');
   const avail = (l) => { const src = S.LJ && S.LJ[SRC[l.topic]]; return !!(src && src.fields && l.fields.every((f) => src.fields[f])); };
-  box.innerHTML = `<div class="tabs">${Object.entries(TOPICS).map(([k, n]) => `<button class="tab ${L.topic === k ? 'on' : ''}" data-topic="${k}">${n}</button>`).join('')}</div>
+  $('btnLayers').innerHTML = `<span class="ic">${L.icon}</span><span class="nm">${esc(L.name)}</span><span class="chev">‹</span>`;
+  box.innerHTML = `<div class="drawer-head"><span class="card-title">Map layers</span><button class="x" id="layersClose" title="Hide">›</button></div>
+    <div class="tabs">${Object.entries(TOPICS).map(([k, n]) => `<button class="tab ${L.topic === k ? 'on' : ''}" data-topic="${k}">${n}</button>`).join('')}</div>
     <div class="lylist">${LAYERS.filter((l) => l.topic === L.topic).map((l) => `<button class="ly ${l.id === L.id ? 'on' : ''}" data-ly="${l.id}" ${avail(l) ? '' : 'disabled title="Not in this update"'}><span>${l.icon}</span>${l.name}</button>`).join('')}</div>
     <div class="card-title">Overlays</div>
     <label><input type="checkbox" id="ov_particles" ${S.ly.particles ? 'checked' : ''}> ${L.particles === 'waves' ? 'Moving wave ripples' : `Moving ${L.particles === 'current' ? 'current' : 'wind'} particles`}</label>
@@ -631,7 +633,15 @@ function renderMenu() {
   $('ov_particles').onchange = (e) => { S.ly.particles = e.target.checked; store.set('kf.layers2', S.ly); redrawMap(); };
   for (const k of Object.keys(OVERLAYS)) $('ov_' + k).onchange = (e) => setOverlay(k, e.target.checked);
   $('baseSel').onchange = (e) => setBase(e.target.value);
+  $('layersClose').onclick = () => setLayersOpen(false);
 }
+// the layer menu is a drawer that slides out from the right edge
+function setLayersOpen(on) {
+  S.layersOpen = !!on; store.set('kf.layersOpen', S.layersOpen);
+  $('layers').classList.toggle('open', S.layersOpen); $('btnLayers').classList.toggle('hidden', S.layersOpen);
+  if (on) { $('spots').classList.add('hidden'); if (!$('route').classList.contains('hidden')) closePanel('route'); }
+}
+$('btnLayers').addEventListener('click', () => setLayersOpen(true));
 function selectLayer(id) {
   S.ly.layer = id; store.set('kf.layers2', S.ly);
   renderMenu(); drawLegend(); resetParticles(); redrawMap();
@@ -733,10 +743,16 @@ function openPoint(lat, lon, spotId) {
   if (pos.wadden) notes.push('current from the fine Wadden grid (~670 m)');
   $('pSub').textContent = notes.join(' · ');
   $('btnSaveSpot').classList.toggle('hidden', !!spot);
+  $('point').classList.add('compact'); setExpandLabel();
   $('point').classList.remove('hidden'); $('routeP').classList.add('hidden');
   renderSpotCfg();
   drawChart();
 }
+function setExpandLabel() { $('btnPExpand').textContent = $('point').classList.contains('compact') ? '⤢ More' : '⤡ Less'; }
+$('btnPExpand').addEventListener('click', () => { $('point').classList.toggle('compact'); setExpandLabel(); drawChart(); });
+$('btnRExpand').addEventListener('click', () => {
+  const c = $('routeP').classList.toggle('compact'); $('btnRExpand').textContent = c ? '⤢ More' : '⤡ Less'; drawRouteChart();
+});
 function closePanel(id) {
   $(id).classList.add('hidden');
   if (id === 'point') { S.sel = null; if (selMarker) { map.removeLayer(selMarker); selMarker = null; } }
@@ -744,7 +760,7 @@ function closePanel(id) {
   if (id === 'route') setDrawing(false);
 }
 document.querySelectorAll('[data-close]').forEach((b) => b.addEventListener('click', () => closePanel(b.dataset.close)));
-map.on('click', (e) => { if (RT.drawing) { addWaypoint(e.latlng); return; } if (S.D) openPoint(e.latlng.lat, e.latlng.lng, null); });
+map.on('click', (e) => { if (S.layersOpen && innerWidth < 760) { setLayersOpen(false); return; } if (RT.drawing) { addWaypoint(e.latlng); return; } if (S.D) openPoint(e.latlng.lat, e.latlng.lng, null); });
 
 const chart = { c: $('chart'), geo: null, hover: null };
 function drawChart() {
@@ -756,7 +772,8 @@ function drawChart() {
   const ser = S.sel.ser, rows = ser.rows, n = rows.length;
   const spot = S.sel.spotId && S.spots.find((s) => s.id === S.sel.spotId);
   const ev = spot ? evaluate(spot, ser) : null;
-  const padL = 36, padR = 40, top = 22, rowH = 17, nRows = 3, bottom = 16;
+  const compact = $('point').classList.contains('compact');
+  const padL = 36, padR = 40, top = 22, rowH = 17, nRows = compact ? 1 : 3, bottom = 16;
   const pb = H - bottom - nRows * rowH - 6, pt = top;
   const t0 = rows[0].t, t1 = rows[n - 1].t;
   const X = (t) => padL + ((t - t0) / (t1 - t0)) * (W - padL - padR);
@@ -783,10 +800,11 @@ function drawChart() {
   }
   // grid + axes
   ctx.font = '10px sans-serif'; ctx.textAlign = 'right'; ctx.fillStyle = col('--muted'); ctx.strokeStyle = 'rgba(255,255,255,0.08)'; ctx.lineWidth = 1;
-  const stepKn = maxKn > 40 ? 10 : 5;
+  let stepKn = maxKn > 40 ? 10 : 5; while ((stepKn / maxKn) * (pb - pt) < 13) stepKn *= 2;
   for (let v = 0; v <= maxKn; v += stepKn) { ctx.beginPath(); ctx.moveTo(padL, YL(v)); ctx.lineTo(W - padR, YL(v)); ctx.stroke(); ctx.fillText(v, padL - 4, YL(v) + 3); }
   ctx.textAlign = 'left';
-  for (let v = 0; v <= maxR + 1e-9; v += maxR > 3 ? 1 : 0.5) ctx.fillText(v.toFixed(1), W - padR + 4, YR(v) + 3);
+  let stepR = maxR > 3 ? 1 : 0.5; while ((stepR / maxR) * (pb - pt) < 13) stepR *= 2;
+  for (let v = 0; v <= maxR + 1e-9; v += stepR) ctx.fillText(v.toFixed(1), W - padR + 4, YR(v) + 3);
   ctx.save(); ctx.translate(10, (pt + pb) / 2); ctx.rotate(-Math.PI / 2); ctx.textAlign = 'center'; ctx.fillText('knots', 0, 0); ctx.restore();
   ctx.save(); ctx.translate(W - 6, (pt + pb) / 2); ctx.rotate(Math.PI / 2); ctx.textAlign = 'center'; ctx.fillText('m  /  kn current', 0, 0); ctx.restore();
   // days
@@ -815,7 +833,7 @@ function drawChart() {
   line('gust', YL, col('--gust'), 1.5, [5, 3]);
   line('ws', YL, col('--wind'), 2.6, null, 'rgba(96,165,250,0.12)');
   // direction rows
-  const labelsRow = ['Wind', 'Waves', 'Current'];
+  const labelsRow = compact ? ['Wind'] : ['Wind', 'Waves', 'Current'];
   const every = Math.max(1, Math.ceil(16 / (half * 2)));
   ctx.font = '10px sans-serif'; ctx.textAlign = 'right';
   labelsRow.forEach((lb, k) => { ctx.fillStyle = col('--muted'); ctx.fillText(lb, padL - 4, pb + 6 + k * rowH + 12); });
@@ -824,6 +842,7 @@ function drawChart() {
     if (i % every) return;
     const x = X(r.t), y0 = pb + 6 + rowH / 2;
     if (Number.isFinite(r.ws)) arrow(ctx, x, y0, r.wd + 180, 12, ev && ev.hours[i].ok ? '#22c55e' : windColor(r.ws), 1.6);
+    if (compact) return;
     if (Number.isFinite(r.vd) && r.hs > 0.03) arrow(ctx, x, y0 + rowH, r.vd + 180, 6 + 4 * Math.min(r.hs, 1.5), '#fff', 1.4);
     if (Number.isFinite(r.cd) && r.cs > 0.03) arrow(ctx, x, y0 + 2 * rowH, r.cd, 6 + 4 * Math.min(r.cs, 1.5), '#22d3ee', 1.4);
   });
@@ -835,6 +854,13 @@ function drawChart() {
   // hover crosshair
   if (chart.hover != null) { const x = X(rows[chart.hover].t); ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.beginPath(); ctx.moveTo(x, pt); ctx.lineTo(x, pb); ctx.stroke(); }
 
+  // values at the map time, in one line
+  const rn = rows[S.ti] || {}, bits = [`<b>${tf(F.dayhm, S.times[S.ti])}</b>`];
+  if (Number.isFinite(rn.ws)) bits.push(`<span style="color:${windColor(rn.ws)}">■</span> <b>${fmt0(rn.ws)}</b> kn ${compass(rn.wd)} · gusts ${fmt0(rn.gust)}`);
+  if (Number.isFinite(rn.hs)) bits.push(`〰 <b>${fmt1(rn.hs)}</b> m ${fmt1(rn.tm)} s`);
+  if (Number.isFinite(rn.cs)) bits.push(`🌊 <b>${fmt1(rn.cs)}</b> kn → ${compass(rn.cd)}`);
+  if (ev) bits.push(ev.hours[S.ti] && ev.hours[S.ti].ok ? '<span style="color:#4ade80">✓ kite OK</span>' : '<span class="muted">✗ no kite</span>');
+  $('pNow').innerHTML = bits.map((b) => `<span class="pi">${b}</span>`).join('<span class="sep"></span>');
   $('chartKey').innerHTML = [
     `<span><i style="background:var(--wind)"></i>Wind (kn)</span>`, `<span><i class="dash"></i>Gusts (kn)</span>`,
     `<span><i style="background:#fff"></i>Waves Hs (m)</span>`, `<span><i style="background:var(--swell)"></i>Swell (m)</span>`,
@@ -903,7 +929,7 @@ function renderSpots() {
     list.appendChild(el);
   }
 }
-$('btnSpots').addEventListener('click', () => $('spots').classList.toggle('hidden'));
+$('btnSpots').addEventListener('click', () => { $('spots').classList.toggle('hidden'); if (!$('spots').classList.contains('hidden')) { setLayersOpen(false); if (!$('route').classList.contains('hidden')) closePanel('route'); } });
 $('btnSaveSpot').addEventListener('click', () => {
   if (!S.sel) return;
   const name = prompt('Name for this spot:', 'My spot'); if (!name) return;
@@ -1072,7 +1098,7 @@ const toLocalInput = (sec) => {
   return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}T${z(d.getHours())}:${z(d.getMinutes())}`;
 };
 function openRoutePanel() {
-  $('spots').classList.add('hidden');
+  $('spots').classList.add('hidden'); setLayersOpen(false);
   if (S.times.length && RT.start < S.times[0]) { RT.start = Math.ceil(Date.now() / 3600000) * 3600; saveRoute(); drawRouteMap(); }
   $('rtStart').value = toLocalInput(RT.start); $('rtSpeed').value = RT.speed;
   $('route').classList.remove('hidden'); setDrawing(true); renderRouteSummary();
@@ -1214,7 +1240,8 @@ function drawRouteChart() {
   const rows = res.rows, n = rows.length, t0 = rows[0].t, t1 = rows[n - 1].t;
   const padL = 40, padR = 10, top = 24, bottom = 20, gap = 14, xL = padL, xR = W - padR;
   const X = (t) => xL + ((t - t0) / (t1 - t0)) * (xR - xL);
-  const spec = [['wind', 1.3], ['angle', 1.2], ['cur', 0.95], ['wave', 0.95]];
+  const rcompact = $('routeP').classList.contains('compact');
+  const spec = rcompact ? [['wind', 1], ['angle', 1]] : [['wind', 1.3], ['angle', 1.2], ['cur', 0.95], ['wave', 0.95]];
   const tot = spec.reduce((s, p) => s + p[1], 0), avail = H - top - bottom - gap * (spec.length - 1), P = {};
   let y = top; for (const [k, w] of spec) { const h = (avail * w) / tot; P[k] = { y0: y, y1: y + h, h }; y += h + gap; }
   rchart.geo = { padL, padR, W, n };
@@ -1254,7 +1281,7 @@ function drawRouteChart() {
     ctx.fillStyle = '#111'; ctx.font = '700 9px sans-serif'; ctx.fillText(i + 1, Math.min(Math.max(x, xL + 7), xR - 7), 22); ctx.font = '10px sans-serif';
   });
   const yTicks = (p, Y, max, step, fmt) => {
-    ctx.textAlign = 'right';
+    ctx.textAlign = 'right'; while (Math.abs(Y(0) - Y(step)) < 13) step *= 2;
     for (let v = 0; v <= max + 1e-9; v += step) {
       const yy = Y(v); ctx.strokeStyle = 'rgba(255,255,255,0.07)'; ctx.beginPath(); ctx.moveTo(xL, yy); ctx.lineTo(xR, yy); ctx.stroke();
       ctx.fillStyle = col('--muted'); ctx.fillText(fmt(v), xL - 4, yy + 3);
@@ -1281,6 +1308,7 @@ function drawRouteChart() {
   }
   line('tca', (v) => YA(v), '#22d3ee', 1.6, [4, 3]);
   // current: bars green when it pushes you along, red when against (stronger colour = more straight along/against)
+  if (!rcompact) {
   const pc = P.cur, maxC = nice(Math.max(0, ...rows.map((r) => r.cs || 0)) + 0.1, 0.5, 1), YC = (v) => pc.y1 - (v / maxC) * (pc.h - STRIP);
   yTicks(pc, YC, maxC, maxC > 2 ? 1 : 0.5, (v) => v.toFixed(1));
   bars('cs', YC, pc, (r) => { const f = r.along / Math.max(r.cs, 1e-6), a = 0.2 + 0.5 * Math.abs(f); return f >= 0 ? `rgba(74,222,128,${a})` : `rgba(248,113,113,${a})`; });
@@ -1290,11 +1318,13 @@ function drawRouteChart() {
   yTicks(pv, YV, maxH, maxH > 3 ? 1 : 0.5, (v) => v.toFixed(1));
   bars('hs', YV, pv, (r) => { const i = lutAt(WL, r.hs); return `rgba(${WL.lut[i]},${WL.lut[i + 1]},${WL.lut[i + 2]},0.6)`; });
   line('sw', YV, col('--swell'), 1.5, [4, 3]); line('hs', YV, '#fff', 1.8);
+  }
   // titles + arrows as seen from the boat (↑ = your course)
   const title = (p, txt) => { ctx.font = '600 11px sans-serif'; ctx.textAlign = 'left'; const w = ctx.measureText(txt).width; ctx.fillStyle = 'rgba(15,23,32,0.75)'; ctx.fillRect(xL + 2, p.y0 + 2, w + 10, 15); ctx.fillStyle = col('--text'); ctx.fillText(txt, xL + 7, p.y0 + 13); ctx.font = '10px sans-serif'; return xL + w + 24; };
-  const ax = { wind: title(pw, 'Wind & gusts, kn'), cur: title(pc, 'Current, kn'), wave: title(pv, 'Waves, m') };
+  const ax = { wind: title(pw, 'Wind & gusts, kn') };
+  if (!rcompact) { ax.cur = title(P.cur, 'Current, kn'); ax.wave = title(P.wave, 'Waves, m'); }
   title(pa, 'Angle to your course · 0° = from ahead');
-  for (const [k, p] of [['wind', pw], ['cur', pc], ['wave', pv]]) {
+  for (const [k, p] of rcompact ? [['wind', pw]] : [['wind', pw], ['cur', P.cur], ['wave', P.wave]]) {
     for (let x = ax[k]; x < xR - 8; x += 40) {
       const r = rows[Math.round(((x - xL) / (xR - xL)) * (n - 1))], yy = p.y0 + 9;
       if (k === 'wind' && Number.isFinite(r.ws)) arrow(ctx, x, yy, r.wd + 180 - r.course, 14, windColor(r.ws), 1.8);
@@ -1488,7 +1518,7 @@ async function applyData(D) {
 async function boot() {
   for (const k of Object.keys(OVERLAYS)) if (S.ly[k]) setOverlay(k, true);
   setBase(S.base);
-  renderMenu();
+  renderMenu(); setLayersOpen(store.get('kf.layersOpen', false));
   drawLegend(); placeCanvases(); frame();
   const D = await fetchData();
   if (!D) { $('status').innerHTML = '<span class="warn">No forecast data yet. The first GitHub update has not run, or it failed.</span>'; return; }
