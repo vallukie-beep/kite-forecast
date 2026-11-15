@@ -77,7 +77,7 @@ HM = {
     "hcc": ((75, 105, 0), lambda a: a * 100 if np.nanmax(a) <= 1.5 else a, 0.01),
     "vis": ((20, 105, 0), lambda a: a, 10),                    # m
 }
-UPDATE_UTC = (4, 40)   # must match the cron in .github/workflows/update.yml
+UPDATE_EVERY_H, UPDATE_MIN = 3, 17   # must match the cron in .github/workflows/update.yml
 KN_PER_MS = 1.943844
 UA = {"User-Agent": "kite-forecast/1.0 (personal, non-commercial)"}
 
@@ -440,8 +440,10 @@ def copy_previous_frames(site, kind, out):
 
 # ---------------------------------------------------------------- MAIN
 def next_update(now):
-    t = now.replace(hour=UPDATE_UTC[0], minute=UPDATE_UTC[1], second=0, microsecond=0)
-    return t if t > now else t + dt.timedelta(days=1)
+    t = now.replace(hour=now.hour - now.hour % UPDATE_EVERY_H, minute=UPDATE_MIN, second=0, microsecond=0)
+    while t <= now:
+        t += dt.timedelta(hours=UPDATE_EVERY_H)
+    return t
 
 
 def main():
