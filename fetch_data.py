@@ -28,6 +28,8 @@ import json
 import math
 import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import tarfile
 import time
 
@@ -321,34 +323,51 @@ def matroos_last_anal(source):
     return sorted(anals)[-1]
 
 
+MATROOS_PARALLEL = threading.Semaphore(6)   # at most 6 requests at once to Matroos, over all sources together
+
+
 def fetch_matroos(source, fields, bbox=BBOX, n=MARINE_N, chunk_h=None):
     """Matroos regridded to a regular lat/lon grid. chunk_h splits big requests into time windows
-    (Matroos answers 503 when one request is too large)."""
+    (Matroos answers 503 when one request is too large). The pieces are fetched in parallel."""
     anal = matroos_last_anal(source)
     t0 = dt.datetime.strptime(anal, "%Y%m%d%H%M").replace(tzinfo=dt.timezone.utc)
     t_end = t0 + dt.timedelta(hours=HORIZON_H)
     step = dt.timedelta(hours=chunk_h or HORIZON_H + 1)
     xn, yn = n
     log(f"{source}: run {anal}, fields {fields}, grid {xn}x{yn}")
-    out = {}
-    times = grid = None
-    for f in fields:  # one field per request keeps Matroos' interpolation fast and errors isolated
-        frames, fts = [], []
-        a_from = t0
-        while a_from <= t_end:
-            a_to = min(a_from + step - dt.timedelta(hours=1), t_end)
+    windows, a_from = [], t0
+    while a_from <= t_end:
+        a_to = min(a_from + step - dt.timedelta(hours=1), t_end)
+        windows.append((a_from, a_to))
+        a_from = a_to + dt.timedelta(hours=1)
+
+    def one(job):   # one field, one time window -> parsed netCDF, or None past the end of the run
+        f, (w0, w1) = job
+        with MATROOS_PARALLEL:
             r = get(f"{MATROOS}/get_matroos.php", params={
                 "source": source, "anal": anal, "color": f,
-                "from": a_from.strftime("%Y%m%d%H%M"), "to": a_to.strftime("%Y%m%d%H%M"), "dtmin": 60,
+                "from": w0.strftime("%Y%m%d%H%M"), "to": w1.strftime("%Y%m%d%H%M"), "dtmin": 60,
                 "xmin": bbox["lon0"], "xmax": bbox["lon1"], "ymin": bbox["lat0"], "ymax": bbox["lat1"],
                 "xn": xn, "yn": yn, "coords": "WGS84", "format": "nc",
             }, timeout=600)
-            a_from = a_to + dt.timedelta(hours=1)
-            if not r.content.startswith(b"CDF"):
-                if fts:
-                    break       # past the end of the model run
+        if not r.content.startswith(b"CDF"):
+            if w0 == t0:
                 raise RuntimeError(f"Matroos: {r.text[:200]}")
-            nc = NC3(r.content)
+            return None
+        return NC3(r.content)
+
+    jobs = [(f, w) for f in fields for w in windows]
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        got = dict(zip(jobs, ex.map(one, jobs)))
+
+    out = {}
+    times = grid = None
+    for f in fields:
+        frames, fts = [], []
+        for w in windows:
+            nc = got[(f, w)]
+            if nc is None:
+                break           # past the end of the model run
             ts = [int(m * 60) for m in nc.get("time")]
             if not ts:
                 break
@@ -357,8 +376,7 @@ def fetch_matroos(source, fields, bbox=BBOX, n=MARINE_N, chunk_h=None):
                 x, y = nc.get("x"), nc.get("y")
                 grid = dict(lon0=float(x[0]), dlon=float((x[-1] - x[0]) / (len(x) - 1)), nx=len(x),
                             lat0=float(y[0]), dlat=float((y[-1] - y[0]) / (len(y) - 1)), ny=len(y))
-            a = nc.get(f)
-            frames.append(a[keep].astype(np.float32))
+            frames.append(nc.get(f)[keep].astype(np.float32))
             fts += [ts[i] for i in keep]
         a = np.concatenate(frames)
         if times is None:
@@ -369,7 +387,7 @@ def fetch_matroos(source, fields, bbox=BBOX, n=MARINE_N, chunk_h=None):
             a = a[[fts.index(t) for t in common]]
             times = common
         out[f] = a
-        log(f"  {f}: {len(fts)} frames, range {np.nanmin(a):.2f}..{np.nanmax(a):.2f}")
+        log(f"  {source} {f}: {len(fts)} frames, range {np.nanmin(a):.2f}..{np.nanmax(a):.2f}")
     return iso(t0), times, grid, out
 
 
@@ -398,13 +416,9 @@ def fetch_current(bbox=BBOX, n=MARINE_N, label="Rijkswaterstaat DCSM7/ZUNO (Matr
 
 
 def fetch_marine_frames(out):
-    """Full-resolution current and wave map frames."""
-    info = {}
-    for kind, source, fields, n, chunk, label in (
-        ("current", CURRENT_SOURCE, CURRENT_FIELDS, CURRENT_FINE_N, 24, "Rijkswaterstaat DCSM7/ZUNO (Matroos)"),
-        ("waves", WAVE_SOURCE, ["wave_height_hm0", "wave_period_tm10", "swellwave_height_hm0", "wave_dir_th0"], WAVES_FINE_N, 6,
-         "Rijkswaterstaat SWAN Kuststrook (Matroos)"),
-    ):
+    """Full-resolution current and wave map frames (both sources side by side)."""
+    def one(spec):
+        kind, source, fields, n, chunk, label = spec
         try:
             run, times, grid, f = fetch_matroos(source, fields, MARINE_BOX, n, chunk)
             names = {"VELU": "cu", "VELV": "cv", "wave_height_hm0": "hs", "wave_period_tm10": "tm",
@@ -414,13 +428,20 @@ def fetch_marine_frames(out):
             for fld, arr in f.items():
                 for i, t in enumerate(times):
                     size += write_frame(out, names[fld], t, arr[i], scales.get(names[fld], 0.01))
-            info[kind] = {"source": label, "run": run, "grid": grid, "times": times,
-                          "fields": {names[k]: {"scale": scales.get(names[k], 0.01)} for k in f}}
             log(f"{kind} frames: {len(times)} hours, {size / 1e6:.0f} MB")
+            return kind, {"source": label, "run": run, "grid": grid, "times": times,
+                          "fields": {names[k]: {"scale": scales.get(names[k], 0.01)} for k in f}}
         except Exception as e:  # noqa: BLE001
             log(f"!! {kind} frames failed: {e}")
-            info[kind] = {"error": str(e)[:300]}
-    return info
+            return kind, {"error": str(e)[:300]}
+
+    specs = (
+        ("current", CURRENT_SOURCE, CURRENT_FIELDS, CURRENT_FINE_N, 24, "Rijkswaterstaat DCSM7/ZUNO (Matroos)"),
+        ("waves", WAVE_SOURCE, ["wave_height_hm0", "wave_period_tm10", "swellwave_height_hm0", "wave_dir_th0"], WAVES_FINE_N, 6,
+         "Rijkswaterstaat SWAN Kuststrook (Matroos)"),
+    )
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        return dict(ex.map(one, specs))
 
 
 def copy_previous_frames(site, kind, out):
@@ -475,15 +496,34 @@ def main():
     now = dt.datetime.now(dt.timezone.utc)
     data = {"generated": iso(now), "next_update": iso(next_update(now)), "bbox": BBOX, "errors": {}}
 
+    # every source at the same time: KNMI and Matroos are separate servers, and the Matroos requests
+    # share one limit of 6 at a time (MATROOS_PARALLEL)
+    t_start = time.time()
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        jobs = {
+            "harmonie": ex.submit(fetch_harmonie, a.out),
+            "marine": ex.submit(fetch_marine_frames, a.out),
+            "waves": ex.submit(fetch_waves),
+            "current": ex.submit(fetch_current),
+            "wadden": ex.submit(fetch_current, WADDEN_BBOX, WADDEN_N, "Rijkswaterstaat DCSM7/ZUNO, fine Wadden grid (Matroos)"),
+        }
+
+    def result(key):
+        try:
+            return jobs[key].result(), None
+        except Exception as e:  # noqa: BLE001
+            log(f"!! {key} failed: {e}")
+            return None, str(e)[:300]
+
     # map layers (full resolution)
     layers = {"generated": iso(now)}
+    (hm, err) = result("harmonie")
     hm_wind = None
-    try:
-        layers["weather"], hm_wind = fetch_harmonie(a.out)
-    except Exception as e:  # noqa: BLE001
-        log(f"!! harmonie failed: {e}")
-        layers["weather"] = {"error": str(e)[:300]}
-    layers.update(fetch_marine_frames(a.out))
+    if hm:
+        layers["weather"], hm_wind = hm
+    else:
+        layers["weather"] = {"error": err}
+    layers.update(result("marine")[0] or {"current": {"error": "failed"}, "waves": {"error": "failed"}})
     for kind in ("weather", "current", "waves"):
         if "error" in layers[kind] and a.previous_site:
             try:
@@ -496,14 +536,20 @@ def main():
         json.dump(layers, fh, separators=(",", ":"))
 
     # point data for spots and graphs; wind from the HARMONIE run above when we have it
-    fetchers = (("wind", (lambda: hm_wind) if hm_wind else fetch_wind), ("waves", fetch_waves), ("current", fetch_current))
-    for key, fn in fetchers:
-        try:
-            data[key] = fn()
+    for key in ("wind", "waves", "current"):
+        if key == "wind":
+            try:
+                val, err = (hm_wind, None) if hm_wind else (fetch_wind(), None)
+            except Exception as e:  # noqa: BLE001
+                val, err = None, str(e)[:300]
+                log(f"!! wind failed: {e}")
+        else:
+            val, err = result(key)
+        if val is not None:
+            data[key] = val
             data[key]["fetched"] = iso(now)
-        except Exception as e:  # noqa: BLE001
-            log(f"!! {key} failed: {e}")
-            data["errors"][key] = str(e)[:300]
+        else:
+            data["errors"][key] = err
             if key in prev:
                 data[key] = prev[key]
                 data[key]["stale"] = True
@@ -517,15 +563,15 @@ def main():
     log(f"wrote {path} ({os.path.getsize(path) / 1e6:.1f} MB)")
 
     # fine Wadden Sea current; optional, the page works without it
-    try:
-        wad = {"generated": iso(now), "bbox": WADDEN_BBOX,
-               "current": fetch_current(WADDEN_BBOX, WADDEN_N, "Rijkswaterstaat DCSM7/ZUNO, fine Wadden grid (Matroos)")}
+    cur, err = result("wadden")
+    if cur:
         path = os.path.join(a.out, "wadden.json")
         with open(path, "w") as fh:
-            json.dump(wad, fh, separators=(",", ":"))
+            json.dump({"generated": iso(now), "bbox": WADDEN_BBOX, "current": cur}, fh, separators=(",", ":"))
         log(f"wrote {path} ({os.path.getsize(path) / 1e6:.1f} MB)")
-    except Exception as e:  # noqa: BLE001
-        log(f"!! wadden current failed (page falls back to the coarse grid): {e}")
+    else:
+        log("!! wadden current failed (page falls back to the coarse grid)")
+    log(f"all sources done in {time.time() - t_start:.0f} s")
 
 
 if __name__ == "__main__":
