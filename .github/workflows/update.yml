@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: read
+  actions: read     # to reuse the data of the last successful run
   pages: write
   id-token: write
 
@@ -22,13 +23,44 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: New data, or reuse the published data?
+        id: mode
+        run: |
+          # an upload that only changes website files (docs/) keeps the current data: publishes in ~1-2 min
+          reuse=false
+          if [ "${{ github.event_name }}" = "push" ]; then
+            changed=$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" 2>/dev/null || echo "?")
+            echo "changed files:"; echo "$changed"
+            if [ -n "$changed" ] && ! echo "$changed" | grep -qvE '^docs/'; then reuse=true; fi
+          fi
+          echo "reuse=$reuse" >> "$GITHUB_OUTPUT"; echo "reuse=$reuse"
+      - name: Reuse the data of the last successful run
+        id: reuse
+        if: steps.mode.outputs.reuse == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id=$(gh run list -R "$GITHUB_REPOSITORY" --workflow update.yml --status success --limit 1 --json databaseId -q '.[0].databaseId')
+          echo "taking the data of run $id"
+          gh run download "$id" -R "$GITHUB_REPOSITORY" -n github-pages -D prev
+          mkdir -p prevsite && tar -xf prev/artifact.tar -C prevsite
+          test -f prevsite/data/layers.json && test -f prevsite/data/forecast.json
+          mkdir -p site && cp -r docs/. site/ && cp -r prevsite/data site/data
+          du -sh site/data
       - uses: actions/setup-python@v5
+        if: steps.mode.outputs.reuse != 'true' || steps.reuse.outcome != 'success'
         with:
           python-version: '3.12'
       - run: pip install requests numpy
+        if: steps.mode.outputs.reuse != 'true' || steps.reuse.outcome != 'success'
       - name: Get the currently published data (fallback if a source fails)
+        if: steps.mode.outputs.reuse != 'true' || steps.reuse.outcome != 'success'
         run: curl -fsSL "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/data/forecast.json" -o previous.json || echo "no previous data"
       - name: Fetch HARMONIE, SWAN and DCSM
+        if: steps.mode.outputs.reuse != 'true' || steps.reuse.outcome != 'success'
         env:
           KNMI_API_KEY: ${{ secrets.KNMI_API_KEY }}   # set under Settings > Secrets and variables > Actions
         run: |
