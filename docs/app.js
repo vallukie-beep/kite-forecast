@@ -644,7 +644,7 @@ function renderStatus() {
   $('status').innerHTML = [
     S.LJ && S.LJ.weather && S.LJ.weather.run ? `<span class="chip">HARMONIE: <b>${tf(F.dayhm, ts(S.LJ.weather.run))}</b> run${S.LJ.weather.stale ? ' <span class="warn">(old: update failed)</span>' : ''}</span>` : run('wind', 'Wind HARMONIE'),
     run('waves', 'Waves SWAN'), run('current', 'Current DCSM'),
-    `<span class="chip ${ageH > 26 ? 'warn' : 'fresh'}">Data fetched <b>${rel(gen)}</b></span>`,
+    `<span class="chip ${ageH > 7 ? 'warn' : 'fresh'}">Data fetched <b>${rel(gen)}</b></span>`,
     `<span class="chip">Next update <b>${tf(F.dayhm, nxt)}</b> (${rel(nxt)})</span>`,
   ].join('');
   $('status').title = `Fetched ${tf(F.full, gen)} (${TZ}). Model runs are shown in local time.` + (Object.keys(D.errors || {}).length ? `\nErrors: ${JSON.stringify(D.errors)}` : '');
@@ -947,8 +947,9 @@ $('btnUpdate').addEventListener('click', () => {
   if (tok) return dispatchUpdate(tok);
   dialog(`<h3>Update the forecast now</h3>
     <p>New data is fetched by a GitHub job. Two ways to start it:</p>
-    <p><b>1. On GitHub</b> (works anywhere): open <a href="${ACTIONS_URL}" target="_blank" rel="noopener">the update job</a>, tap <i>Run workflow</i>, then <i>Run workflow</i> again. New data appears here after about 3 minutes.</p>
+    <p><b>1. On GitHub</b> (works anywhere): open <a href="${ACTIONS_URL}" target="_blank" rel="noopener">the update job</a>, tap <i>Run workflow</i>, then <i>Run workflow</i> again. New data appears here after about 10–15 minutes.</p>
     <p><b>2. One tap from this page:</b> paste a GitHub fine-grained token with access to only the <code>${esc(REPO.repo)}</code> repository and the permission <i>Actions: Read and write</i>. It is stored only in this browser.</p>
+    <p class="small muted">Make one at <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com/settings/personal-access-tokens/new</a>: <i>Repository access</i> → <i>Only select repositories</i> → <code>${esc(REPO.repo)}</code>; <i>Permissions</i> → <i>Actions</i> → <i>Read and write</i>; then <i>Generate token</i> and copy it.</p>
     <input type="password" id="tokIn" placeholder="github_pat_…" autocomplete="off">
     <div class="btns"><button class="btn ghost" id="dlgCancel">Close</button><a class="btn ghost" href="${ACTIONS_URL}" target="_blank" rel="noopener">Open GitHub</a><button class="btn" id="tokSave">Save token &amp; update</button></div>`);
   $('dlgCancel').onclick = closeDialog;
@@ -959,7 +960,13 @@ async function gh(path, tok, opts = {}) {
 }
 async function dispatchUpdate(tok) {
   const before = S.D && S.D.generated, started = Date.now();
-  const show = (msg, busy = true) => dialog(`<h3>Updating forecast</h3><p>${msg}</p>${busy ? '<div class="progress"><div></div></div>' : ''}<div class="btns"><button class="btn ghost" id="dlgCancel">Close</button></div>`) || ($('dlgCancel').onclick = closeDialog);
+  let opened = false;
+  const show = (msg, busy = true) => {
+    if (busy && opened && $('dlg').classList.contains('hidden')) return; // closed by the user: keep checking quietly
+    opened = true;
+    dialog(`<h3>Updating forecast</h3><p>${msg}</p>${busy ? '<div class="progress"><div></div></div>' : ''}<div class="btns"><button class="btn ghost" id="dlgCancel">Close</button></div>`);
+    $('dlgCancel').onclick = closeDialog;
+  };
   show('Starting the GitHub job…');
   try {
     const r = await gh(`/actions/workflows/${WORKFLOW}/dispatches`, tok, { method: 'POST', body: JSON.stringify({ ref: 'main' }) });
@@ -971,7 +978,7 @@ async function dispatchUpdate(tok) {
     if (!r.ok) throw new Error(`GitHub answered HTTP ${r.status}`);
   } catch (e) { show(`Could not start the job: ${esc(e.message)}`, false); return; }
   // follow the run, then wait for the new data file
-  for (let k = 0; k < 80; k++) {
+  for (let k = 0; k < 150; k++) {
     await new Promise((res) => setTimeout(res, 10000));
     let state = 'waiting for GitHub';
     try {
@@ -984,7 +991,7 @@ async function dispatchUpdate(tok) {
     } catch { /* keep polling */ }
     const fresh = await fetchData();
     if (fresh && fresh.generated !== before) { applyData(fresh); show('Done: new data loaded.', false); setTimeout(closeDialog, 1500); return; }
-    show(`${state} · ${Math.round((Date.now() - started) / 1000)} s. This usually takes 2–4 minutes.`);
+    show(`${state} · ${Math.round((Date.now() - started) / 1000)} s. This usually takes 10–15 minutes; you can close this, the page keeps checking.`);
   }
   show('This is taking longer than expected. The page will pick up the new data on its own once it is published.', false);
 }
