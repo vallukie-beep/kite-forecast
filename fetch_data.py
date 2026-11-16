@@ -27,6 +27,8 @@ import io
 import json
 import math
 import os
+import re
+import shutil
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -34,6 +36,7 @@ import tarfile
 import time
 
 import numpy as np
+from zoneinfo import ZoneInfo
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -79,7 +82,7 @@ HM = {
     "hcc": ((75, 105, 0), lambda a: a * 100 if np.nanmax(a) <= 1.5 else a, 0.01),
     "vis": ((20, 105, 0), lambda a: a, 10),                    # m
 }
-UPDATE_EVERY_H, UPDATE_MIN = 3, 17   # must match the cron in .github/workflows/update.yml
+UPDATE_EVERY_H, UPDATE_MIN = 1, 17   # must match the cron in .github/workflows/update.yml
 KN_PER_MS = 1.943844
 UA = {"User-Agent": "kite-forecast/1.0 (personal, non-commercial)"}
 
@@ -209,14 +212,23 @@ def knmi(path, key, **kw):
     return r.json()
 
 
-def fetch_harmonie(out):
+class SameRun(Exception):
+    """KNMI has no newer HARMONIE run than the one already published."""
+
+
+def fetch_harmonie(out, published_run=None):
     """Download the newest HARMONIE P1 run, write every map frame, and return
-    (layer info, wind block for forecast.json)."""
+    (layer info, wind block for forecast.json). Raises SameRun when that run is already published."""
     key = os.environ.get("KNMI_API_KEY", "").strip()
     if not key:
         raise RuntimeError("no KNMI_API_KEY set")
     files = knmi("/files", key, params={"maxKeys": 5, "orderBy": "created", "sorting": "desc"})["files"]
     name = files[0]["filename"]
+    m = re.search(r"(\d{10})\.tar$", name)
+    if m and published_run:
+        newest = dt.datetime.strptime(m.group(1), "%Y%m%d%H").replace(tzinfo=dt.timezone.utc)
+        if iso(newest) == published_run:
+            raise SameRun(published_run)
     url = knmi(f"/files/{name}/url", key)["temporaryDownloadUrl"]
     log(f"harmonie: {name} ({files[0].get('size', 0) / 1e6:.0f} MB)")
 
@@ -474,6 +486,8 @@ def main():
     ap.add_argument("--out", default="docs/data")
     ap.add_argument("--previous", help="previous forecast.json; used for any source that fails")
     ap.add_argument("--previous-site", help="URL of the live site, to reuse its map frames when a source fails")
+    ap.add_argument("--previous-dir", help="the data folder of the last published site; unchanged sources are copied from it")
+    ap.add_argument("--full", action="store_true", help="fetch every source, even when the published data is still current")
     ap.add_argument("--weather-only", action="store_true", help="test: only fetch HARMONIE map frames (merged into an existing layers.json)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -486,8 +500,17 @@ def main():
         log("wrote", path)
         return
 
-    prev = {}
-    if a.previous and os.path.exists(a.previous):
+    # the data published by the last successful run (unpacked by the workflow); reused where nothing changed
+    pdir = a.previous_dir if a.previous_dir and os.path.isdir(a.previous_dir) else None
+
+    def pjson(name):
+        try:
+            return json.load(open(os.path.join(pdir, name))) if pdir else {}
+        except Exception as e:  # noqa: BLE001
+            log(f"previous {name} unreadable: {e}")
+            return {}
+    prev, prev_layers, prev_wad = pjson("forecast.json"), pjson("layers.json"), pjson("wadden.json")
+    if not prev and a.previous and os.path.exists(a.previous):
         try:
             prev = json.load(open(a.previous))
         except Exception as e:  # noqa: BLE001
@@ -496,39 +519,80 @@ def main():
     now = dt.datetime.now(dt.timezone.utc)
     data = {"generated": iso(now), "next_update": iso(next_update(now)), "bbox": BBOX, "errors": {}}
 
+    # HARMONIE every run (skipped when KNMI has no newer run); waves and current once a day
+    marine_due = a.full or not pdir or marine_is_due(prev_layers, now)
+    published_run = None if a.full or not pdir else (prev_layers.get("weather") or {}).get("run")
+    log(f"plan: HARMONIE {'(if newer than ' + published_run + ')' if published_run else '(always)'}, "
+        f"waves/current {'fetch' if marine_due else 'reuse (fetched once a day, after %02d:00 Amsterdam)' % MARINE_HOUR}")
+
     # every source at the same time: KNMI and Matroos are separate servers, and the Matroos requests
     # share one limit of 6 at a time (MATROOS_PARALLEL)
     t_start = time.time()
     with ThreadPoolExecutor(max_workers=5) as ex:
-        jobs = {
-            "harmonie": ex.submit(fetch_harmonie, a.out),
-            "marine": ex.submit(fetch_marine_frames, a.out),
-            "waves": ex.submit(fetch_waves),
-            "current": ex.submit(fetch_current),
-            "wadden": ex.submit(fetch_current, WADDEN_BBOX, WADDEN_N, "Rijkswaterstaat DCSM7/ZUNO, fine Wadden grid (Matroos)"),
-        }
+        jobs = {"harmonie": ex.submit(fetch_harmonie, a.out, published_run)}
+        if marine_due:
+            jobs.update({
+                "marine": ex.submit(fetch_marine_frames, a.out),
+                "waves": ex.submit(fetch_waves),
+                "current": ex.submit(fetch_current),
+                "wadden": ex.submit(fetch_current, WADDEN_BBOX, WADDEN_N, "Rijkswaterstaat DCSM7/ZUNO, fine Wadden grid (Matroos)"),
+            })
 
     def result(key):
+        if key not in jobs:
+            return None, "not fetched in this run"
         try:
             return jobs[key].result(), None
+        except SameRun:
+            return None, "same"
         except Exception as e:  # noqa: BLE001
             log(f"!! {key} failed: {e}")
             return None, str(e)[:300]
 
+    def keep(kind, stale):
+        """Copy the previously published frames of one source; stale=True marks a failed update."""
+        info = dict(prev_layers[kind])
+        n = 0
+        for fld in info.get("fields", {}):
+            src = os.path.join(pdir, "f", fld)
+            if os.path.isdir(src):
+                shutil.copytree(src, os.path.join(a.out, "f", fld), dirs_exist_ok=True)
+                n += len(os.listdir(src))
+        if stale:
+            info["stale"] = True
+        else:
+            info.pop("stale", None)
+        log(f"   {kind}: kept the published frames ({n} files, run {info.get('run')})")
+        return info
+
     # map layers (full resolution)
     layers = {"generated": iso(now)}
-    (hm, err) = result("harmonie")
+    hm, err = result("harmonie")
     hm_wind = None
     if hm:
         layers["weather"], hm_wind = hm
+        layers["weather"]["fetched"] = iso(now)
+    elif err == "same" and "error" not in prev_layers.get("weather", {"error": 1}):
+        log(f"harmonie: no newer run than {published_run}")
+        layers["weather"] = keep("weather", False)
     else:
         layers["weather"] = {"error": err}
-    layers.update(result("marine")[0] or {"current": {"error": "failed"}, "waves": {"error": "failed"}})
+    if marine_due:
+        layers.update(result("marine")[0] or {"current": {"error": "failed"}, "waves": {"error": "failed"}})
+        for kind in ("current", "waves"):
+            if "error" not in layers[kind]:
+                layers[kind]["fetched"] = iso(now)
+    else:
+        for kind in ("current", "waves"):
+            layers[kind] = keep(kind, False)
     for kind in ("weather", "current", "waves"):
-        if "error" in layers[kind] and a.previous_site:
+        if "error" in layers[kind]:
+            err = layers[kind]["error"]
             try:
-                err = layers[kind]["error"]
-                layers[kind] = copy_previous_frames(a.previous_site, kind, a.out)
+                if pdir and "error" not in prev_layers.get(kind, {"error": 1}):
+                    layers[kind] = keep(kind, True)
+                elif a.previous_site:
+                    layers[kind] = copy_previous_frames(a.previous_site, kind, a.out)
                 layers[kind]["error"] = err
             except Exception as e:  # noqa: BLE001
                 log(f"   no previous {kind} frames: {e}")
@@ -537,6 +601,11 @@ def main():
 
     # point data for spots and graphs; wind from the HARMONIE run above when we have it
     for key in ("wind", "waves", "current"):
+        reuse = key in prev and not prev[key].get("stale") and (
+            (key != "wind" and not marine_due) or (key == "wind" and err_same(jobs)))
+        if reuse:
+            data[key] = prev[key]
+            continue
         if key == "wind":
             try:
                 val, err = (hm_wind, None) if hm_wind else (fetch_wind(), None)
@@ -563,15 +632,46 @@ def main():
     log(f"wrote {path} ({os.path.getsize(path) / 1e6:.1f} MB)")
 
     # fine Wadden Sea current; optional, the page works without it
-    cur, err = result("wadden")
+    path = os.path.join(a.out, "wadden.json")
+    cur, err = result("wadden") if marine_due else (None, "reuse")
     if cur:
-        path = os.path.join(a.out, "wadden.json")
         with open(path, "w") as fh:
             json.dump({"generated": iso(now), "bbox": WADDEN_BBOX, "current": cur}, fh, separators=(",", ":"))
         log(f"wrote {path} ({os.path.getsize(path) / 1e6:.1f} MB)")
+    elif prev_wad:
+        shutil.copy(os.path.join(pdir, "wadden.json"), path)
+        log("wadden.json: kept the published one")
     else:
         log("!! wadden current failed (page falls back to the coarse grid)")
     log(f"all sources done in {time.time() - t_start:.0f} s")
+
+
+def err_same(jobs):
+    """True when HARMONIE was skipped because the published run is still the newest."""
+    try:
+        jobs["harmonie"].result()
+        return False
+    except SameRun:
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+MARINE_HOUR = 5   # waves and current are refreshed by the first run after 05:00 Amsterdam time
+
+
+def marine_is_due(prev_layers, now):
+    """Waves/current are fetched once a day: when the published ones are from before today's 05:00
+    (Amsterdam), failed last time, or carry no fetch time."""
+    infos = [prev_layers.get(k) or {} for k in ("current", "waves")]
+    if any("error" in i or i.get("stale") or not i.get("fetched") for i in infos):
+        return True
+    last = min(dt.datetime.fromisoformat(i["fetched"].replace("Z", "+00:00")) for i in infos)
+    loc = now.astimezone(ZoneInfo("Europe/Amsterdam"))
+    cut = loc.replace(hour=MARINE_HOUR, minute=0, second=0, microsecond=0)
+    if loc < cut:
+        cut -= dt.timedelta(days=1)
+    return last < cut
 
 
 if __name__ == "__main__":
