@@ -2,8 +2,20 @@ name: Update forecast
 
 on:
   schedule:
-    - cron: '17 */3 * * *'   # every 3 hours at :17 UTC (GitHub sometimes skips a scheduled run); keep in sync with UPDATE_EVERY_H / UPDATE_MIN in fetch_data.py
+    # every hour at :17 UTC. GitHub skips many scheduled runs, so hourly gives the bike alert (06:00-07:30 and
+    # 14:00-15:30 Amsterdam) two chances per window and keeps HARMONIE under 4 h old.
+    # Keep in sync with UPDATE_EVERY_H / UPDATE_MIN in fetch_data.py.
+    - cron: '17 * * * *'
   workflow_dispatch:        # the "Update now" button
+    inputs:
+      bike_test:
+        description: Send a test bike alert to the phone
+        type: boolean
+        default: false
+      full:
+        description: Also refresh waves and current now (normally once a day)
+        type: boolean
+        default: false
   push:
     branches: [main]
 
@@ -36,18 +48,21 @@ jobs:
             if [ -n "$changed" ] && ! echo "$changed" | grep -qvE '^docs/'; then reuse=true; fi
           fi
           echo "reuse=$reuse" >> "$GITHUB_OUTPUT"; echo "reuse=$reuse"
-      - name: Reuse the data of the last successful run
-        id: reuse
-        if: steps.mode.outputs.reuse == 'true'
+      - name: Get the data of the last successful run
+        id: prev
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           id=$(gh run list -R "$GITHUB_REPOSITORY" --workflow update.yml --status success --limit 1 --json databaseId -q '.[0].databaseId')
-          echo "taking the data of run $id"
+          echo "previous data from run $id"
           gh run download "$id" -R "$GITHUB_REPOSITORY" -n github-pages -D prev
           mkdir -p prevsite && tar -xf prev/artifact.tar -C prevsite
           test -f prevsite/data/layers.json && test -f prevsite/data/forecast.json
+      - name: Reuse that data (website-only change)
+        id: reuse
+        if: steps.mode.outputs.reuse == 'true' && steps.prev.outcome == 'success'
+        run: |
           mkdir -p site && cp -r docs/. site/ && cp -r prevsite/data site/data
           du -sh site/data
       - uses: actions/setup-python@v5
@@ -56,18 +71,26 @@ jobs:
           python-version: '3.12'
       - run: pip install requests numpy
         if: steps.mode.outputs.reuse != 'true' || steps.reuse.outcome != 'success'
-      - name: Get the currently published data (fallback if a source fails)
-        if: steps.mode.outputs.reuse != 'true' || steps.reuse.outcome != 'success'
-        run: curl -fsSL "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/data/forecast.json" -o previous.json || echo "no previous data"
-      - name: Fetch HARMONIE, SWAN and DCSM
+      - name: Fetch HARMONIE (every run), SWAN and DCSM (once a day)
         if: steps.mode.outputs.reuse != 'true' || steps.reuse.outcome != 'success'
         env:
           KNMI_API_KEY: ${{ secrets.KNMI_API_KEY }}   # set under Settings > Secrets and variables > Actions
         run: |
           mkdir -p site && cp -r docs/. site/
-          python fetch_data.py --out site/data --previous previous.json \
+          prev=""; [ -f prevsite/data/layers.json ] && prev="--previous-dir prevsite/data"
+          python fetch_data.py --out site/data $prev ${{ inputs.full && '--full' || '' }} \
             --previous-site "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
           du -sh site/data
+      - name: Bike to work - rain check and phone alert
+        if: steps.mode.outputs.reuse != 'true' || steps.reuse.outcome != 'success'
+        continue-on-error: true
+        env:
+          BIKE_ALERT: ${{ secrets.BIKE_ALERT }}               # made by the web page (phone subscription + home/work)
+          VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
+          BIKE_TEST: ${{ inputs.bike_test }}
+        run: |
+          pip install -q pywebpush
+          python bike_check.py --data site/data --previous-site "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
