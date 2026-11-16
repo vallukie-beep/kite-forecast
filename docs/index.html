@@ -12,6 +12,8 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 2 L28 14 L16 22 L4 14Z' fill='%2322c55e'/%3E%3Cpath d='M16 22 Q14 27 18 30' stroke='%2322c55e' stroke-width='2' fill='none'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
 <link rel="stylesheet" href="style.css">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
 </head>
 <body>
 <header id="top">
@@ -41,6 +43,21 @@
     <option value="osm">Street map</option>
   </select>
 </div>
+
+<button id="bikePill" class="bike-pill" title="Dry commute check">🚲</button>
+
+<aside id="bike" class="panel hidden">
+  <div class="panel-head"><b>🚲 Dry to work?</b><button class="x" data-close="bike">×</button></div>
+  <div id="bkStatus"></div>
+  <div class="bk-set">
+    <div class="rt-btns"><button class="btn small ghost" id="bkHome">🏠 Set home</button><button class="btn small ghost" id="bkWork">🏢 Set work</button></div>
+    <label>Morning <span><input type="time" id="bkAm0"> – <input type="time" id="bkAm1"></span></label>
+    <label>Afternoon <span><input type="time" id="bkPm0"> – <input type="time" id="bkPm1"></span></label>
+  </div>
+  <button class="btn" id="bkPush" style="width:100%;margin-top:8px">🔔 Turn on phone alerts</button>
+  <div id="bkSetup" class="hidden"></div>
+  <p class="small muted">The phone alert comes with the first update between 06:00 and 07:30 (both windows) and between 14:00 and 15:30 (afternoon), checked against the newest HARMONIE run. If that run is more than 4 hours old, the alert says so instead of guessing.</p>
+</aside>
 
 <div id="legend" class="card"><canvas id="legendCanvas" width="260" height="10"></canvas><div id="legendLabels"></div><div class="legend-unit">wind, knots</div></div>
 <div id="readout" class="card hidden"></div>

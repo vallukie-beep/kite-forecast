@@ -184,6 +184,32 @@ textarea { width: 100%; background: var(--panel-solid); border: 1px solid var(--
 .progress div { height: 100%; width: 30%; background: var(--accent); animation: slide 1.4s infinite ease-in-out; }
 @keyframes slide { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
 
+/* bike to work */
+.bike-pill { position: fixed; z-index: 900; top: 62px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 6px;
+  background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 20px; padding: 5px 12px; font-size: 13px; cursor: pointer;
+  box-shadow: 0 2px 10px rgba(0,0,0,.35); white-space: nowrap; }
+.bk-dot { display: inline-grid; place-items: center; width: 18px; height: 18px; border-radius: 50%; font: 700 11px sans-serif; color: #111; background: #64748b; margin-left: 4px; }
+.bk-dot.green { background: #22c55e; } .bk-dot.amber { background: #f59e0b; } .bk-dot.red { background: #ef4444; color: #fff; }
+.bk-dot.na, .bk-dot.old { background: #64748b; color: #fff; }
+#bike { top: 60px; left: 50%; transform: translateX(-50%); width: 340px; max-height: calc(100% - 150px); overflow: auto; border-radius: 12px; padding: 10px 12px; }
+.bk-win { display: flex; gap: 12px; align-items: center; margin: 8px 0; padding: 8px; border: 1px solid var(--line); border-radius: 10px; }
+.tlight { display: grid; gap: 4px; background: #0b0f14; padding: 5px; border-radius: 10px; border: 1px solid #333; }
+.tlight i { width: 16px; height: 16px; border-radius: 50%; opacity: .18; }
+.tlight .r { background: #ef4444; } .tlight .a { background: #f59e0b; } .tlight .g { background: #22c55e; }
+.tlight i.on { opacity: 1; box-shadow: 0 0 10px currentColor; }
+.tlight .r.on { color: #ef4444; } .tlight .a.on { color: #f59e0b; } .tlight .g.on { color: #22c55e; }
+.bk-hours { display: flex; flex-wrap: wrap; gap: 2px 8px; margin-top: 3px; color: var(--muted); }
+.bk-hours .damp { color: #fbbf24; } .bk-hours .wet { color: #f87171; font-weight: 600; }
+.bk-set { display: grid; gap: 6px; border-top: 1px solid var(--line); padding-top: 8px; }
+.bk-set label { display: flex; justify-content: space-between; align-items: center; font-size: 13px; }
+.bk-set input { background: var(--panel-solid); border: 1px solid var(--line); border-radius: 6px; padding: 2px 4px; }
+#bkSetup { margin-top: 8px; border: 1px solid rgba(34,197,94,.5); border-radius: 10px; padding: 8px; }
+#bkSetup ol { padding-left: 18px; margin: 4px 0; }
+#bkSetup a { color: #7dd3fc; }
+.btns-row { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+.bk-pin-icon { background: none; border: 0; }
+.bk-pin { width: 24px; height: 24px; border-radius: 50%; background: #fff; display: grid; place-items: center; font-size: 13px; box-shadow: 0 1px 4px rgba(0,0,0,.6); }
+
 @media (max-width: 760px) {
   /* top bar: one row of brand + icon buttons, status as one scrollable line below */
   #top { flex-wrap: wrap; gap: 4px 8px; padding-bottom: 6px; }
@@ -203,7 +229,9 @@ textarea { width: 100%; background: var(--panel-solid); border: 1px solid var(--
   .layers-tab .nm { display: none; }
   .ly { padding: 7px 6px; font-size: 14px; }
   .tab { padding: 7px 4px; font-size: 13px; }
-  #spots, #route { left: 8px; right: 8px; width: auto; top: calc(96px + env(safe-area-inset-top)); }
+  #spots, #route, #bike { left: 8px; right: 8px; width: auto; transform: none; top: calc(96px + env(safe-area-inset-top)); }
+  .bike-pill { top: calc(100px + env(safe-area-inset-top)); font-size: 12px; }
+  #bike { top: calc(140px + env(safe-area-inset-top)); }
   #route { max-height: 46%; }
   #legend { width: 168px; bottom: calc(66px + env(safe-area-inset-bottom)); left: 8px; padding: 5px 7px; }
   #legendCanvas { width: 152px; height: 8px; }

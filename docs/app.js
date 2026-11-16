@@ -703,7 +703,7 @@ document.addEventListener('keydown', (e) => {
   if (e.target.matches('input[type=text],input[type=number],textarea')) return;
   if (e.key === 'ArrowRight') setTime(S.ti + 1);
   if (e.key === 'ArrowLeft') setTime(S.ti - 1);
-  if (e.key === 'Escape') { closePanel('point'); closePanel('routeP'); }
+  if (e.key === 'Escape') { closePanel('point'); closePanel('routeP'); closePanel('bike'); }
 });
 
 // ------------------------------------------------------------------ status bar
@@ -758,9 +758,12 @@ function closePanel(id) {
   if (id === 'point') { S.sel = null; if (selMarker) { map.removeLayer(selMarker); selMarker = null; } }
   if (id === 'routeP') setRouteHover(null);
   if (id === 'route') setDrawing(false);
+  if (id === 'bike') { BK.picking = null; if (!RT.drawing) $('map').classList.remove('rt-drawing'); }
 }
 document.querySelectorAll('[data-close]').forEach((b) => b.addEventListener('click', () => closePanel(b.dataset.close)));
-map.on('click', (e) => { if (S.layersOpen && innerWidth < 760) { setLayersOpen(false); return; } if (RT.drawing) { addWaypoint(e.latlng); return; } if (S.D) openPoint(e.latlng.lat, e.latlng.lng, null); });
+map.on('click', (e) => {
+  if (BK.picking) { BK[BK.picking] = [+e.latlng.lat.toFixed(4), +e.latlng.lng.toFixed(4)]; BK.picking = null; $('map').classList.remove('rt-drawing'); bikeSettingsChanged(); renderBikePanel(); return; }
+  if (S.layersOpen && innerWidth < 760) { setLayersOpen(false); return; } if (RT.drawing) { addWaypoint(e.latlng); return; } if (S.D) openPoint(e.latlng.lat, e.latlng.lng, null); });
 
 const chart = { c: $('chart'), geo: null, hover: null };
 function drawChart() {
@@ -1377,6 +1380,166 @@ document.querySelector('[data-open-route]').addEventListener('click', openRouteP
 window.addEventListener('resize', drawRouteChart);
 drawRouteMap();
 
+// ------------------------------------------------------------------ bike to work: rain traffic light + phone alert
+// Checks HARMONIE hourly rain along home → work for the morning and afternoon windows (Amsterdam time).
+// Home and work stay in this browser; the phone alert gets them through a GitHub secret (never in the repo).
+const VAPID_PUBLIC = 'BDWpdDoz7TgkuZfwBr-tRuiAOVJiZRK21F9nz4X1rwY9KnWP88GUa5Z27JA8M0kccCX_LfEa3VyHmr6z9daZTaM';
+const BK_DRY = 0.1, BK_LIGHT = 0.5, BK_MAX_AGE_H = 4;   // mm/h; model run may be at most 4 h old
+const BK = Object.assign({ home: null, work: null, am: ['07:30', '09:30'], pm: ['16:00', '18:00'] }, store.get('kf.bike', {}));
+BK.picking = null; BK.res = null;
+const bkLayer = L.layerGroup().addTo(map);
+function saveBike() { store.set('kf.bike', { home: BK.home, work: BK.work, am: BK.am, pm: BK.pm }); }
+
+const TZPARTS = new Intl.DateTimeFormat('en-GB', { timeZone: TZ, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' });
+function amsParts(sec) { const p = {}; for (const x of TZPARTS.formatToParts(new Date(sec * 1000))) if (x.type !== 'literal') p[x.type] = +x.value; return p; }
+const tzOffsetSec = (sec) => { const p = amsParts(sec); return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) / 1000 - sec; };
+function amsToUnix(y, mo, d, hh, mm) { const g = Date.UTC(y, mo - 1, d, hh, mm) / 1000; return g - tzOffsetSec(g - tzOffsetSec(g)); }
+function windowUnix(day, win) {
+  const [h0, m0] = win[0].split(':').map(Number), [h1, m1] = win[1].split(':').map(Number);
+  return [amsToUnix(day.year, day.month, day.day, h0, m0), amsToUnix(day.year, day.month, day.day, h1, m1)];
+}
+// home, work and a point every ~1 km in between
+function bikePoints() {
+  const pts = [BK.home, BK.work].filter(Boolean);
+  if (BK.home && BK.work) {
+    const n = Math.max(1, Math.ceil(kmBetween(BK.home[0], BK.home[1], BK.work[0], BK.work[1])));
+    for (let i = 1; i < n; i++) pts.push([BK.home[0] + ((BK.work[0] - BK.home[0]) * i) / n, BK.home[1] + ((BK.work[1] - BK.home[1]) * i) / n]);
+  }
+  return pts;
+}
+function modelAge() {
+  const w = S.LJ && S.LJ.weather; if (!w || !w.run) return null;
+  const h = (Date.now() / 1000 - Date.parse(w.run) / 1000) / 3600;
+  return { run: Date.parse(w.run) / 1000, h, ok: h <= BK_MAX_AGE_H && !w.stale && !w.error };
+}
+// rain in a window: hourly frames whose hour (H-1h, H] overlaps it; worst 3x3 cell (~±2.5 km) around every point
+async function checkWindow(a, b, pts) {
+  const src = S.LJ && S.LJ.weather, fi = src && src.fields && src.fields.precip;
+  if (!fi || !src.grid) return { st: 'na', why: 'no rain data in this update' };
+  const times = fi.times || src.times, exp = [];
+  for (let H = Math.floor(a / 3600) * 3600 + 3600; H - 3600 < b; H += 3600) exp.push(H);
+  if (!exp.every((H) => times.includes(H))) return { st: 'na', why: b < times[0] ? 'already past' : 'not in the forecast yet' };
+  const g = src.grid, per = [];
+  for (const H of exp) {
+    const A = await loadFrame('precip', H, fi.scale); if (!A) return { st: 'na', why: 'rain data did not load' };
+    let mx = 0;
+    for (const [la, lo] of pts) {
+      const cx = Math.round((lo - g.lon0) / g.dlon), cy = Math.round((la - g.lat0) / g.dlat);
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const x = cx + dx, y = cy + dy; if (x < 0 || y < 0 || x >= g.nx || y >= g.ny) continue;
+        const v = A[y * g.nx + x]; if (v > mx) mx = v;
+      }
+    }
+    per.push({ H, mm: mx });
+  }
+  const max = Math.max(...per.map((p) => p.mm));
+  return { st: max < BK_DRY ? 'green' : max < BK_LIGHT ? 'amber' : 'red', max, per };
+}
+const BK_TXT = { green: ['✓', 'Dry'], amber: ['!', 'A few drops possible'], red: ['✗', 'Rain'], na: ['?', 'Unknown'], old: ['?', 'Not verified'] };
+let bkTok = 0;
+async function renderBike() {
+  const tok = ++bkTok, pill = $('bikePill');
+  if (!BK.home || !BK.work) {
+    pill.innerHTML = '🚲 <span class="muted">Set up the dry-commute check</span>';
+    if (!$('bike').classList.contains('hidden')) renderBikePanel(); return;
+  }
+  const now = Date.now() / 1000;
+  let day = amsParts(now);
+  if (now > windowUnix(day, BK.pm)[1]) day = amsParts(now + 86400);            // today's windows are over: show tomorrow
+  const today = amsParts(now).day === day.day, pts = bikePoints(), age = modelAge();
+  const wins = [];
+  for (const [k, w] of [['am', BK.am], ['pm', BK.pm]]) {
+    const [a, b] = windowUnix(day, w);
+    const r = b < now ? { st: 'na', why: 'already past' } : await checkWindow(a, b, pts);
+    if (r.st !== 'na' && age && !age.ok) { r.st0 = r.st; r.st = 'old'; }
+    wins.push({ k, w, a, b, ...r });
+  }
+  if (tok !== bkTok) return;
+  BK.res = { day, today, wins, age };
+  pill.innerHTML = `🚲 <span class="muted">${today ? 'Today' : 'Tomorrow'}</span>` + wins.map((x) =>
+    `<span class="bk-dot ${x.st}" title="${x.w[0]}–${x.w[1]}: ${BK_TXT[x.st][1]}">${BK_TXT[x.st][0]}</span>${x.w[0]}`).join('');
+  if (!$('bike').classList.contains('hidden')) renderBikePanel();
+}
+function renderBikePanel() {
+  const R = BK.res, age = modelAge(), pushed = store.get('kf.bikePush', false);
+  let h = '';
+  if (!BK.home || !BK.work) h += '<p class="small">Set your home and work on the map. They are stored in this browser only.</p>';
+  else if (R) {
+    h += `<div class="small muted">${R.today ? 'Today' : 'Tomorrow'}, ${tf(F.day, R.wins[0].a)}</div>`;
+    for (const x of R.wins) {
+      const lit = { red: 'r', amber: 'a', green: 'g' }[x.st];
+      const per = x.per ? x.per.map((p) => `<span class="${p.mm >= BK_LIGHT ? 'wet' : p.mm >= BK_DRY ? 'damp' : ''}">${tf(F.hm, p.H - 3600).slice(0, 2)}–${tf(F.hm, p.H).slice(0, 2)} h ${p.mm.toFixed(1)}</span>`).join('') : '';
+      h += `<div class="bk-win"><div class="tlight"><i class="r ${lit === 'r' ? 'on' : ''}"></i><i class="a ${lit === 'a' ? 'on' : ''}"></i><i class="g ${lit === 'g' ? 'on' : ''}"></i></div>
+        <div><b>${x.w[0]}–${x.w[1]}</b> · <span class="bk-dot ${x.st}">${BK_TXT[x.st][0]}</span> ${BK_TXT[x.st][1]}
+        <div class="small muted">${x.st === 'old' ? `model run too old to trust (would be: ${BK_TXT[x.st0][1].toLowerCase()})` : x.why ? esc(x.why) : `most rain: ${x.max.toFixed(1)} mm/h`}</div>
+        ${per ? `<div class="bk-hours small">${per}</div>` : ''}</div></div>`;
+    }
+  }
+  h += age ? `<p class="small ${age.ok ? '' : 'warn'}">${age.ok ? '✓' : '⚠'} HARMONIE run ${tf(F.dayhm, age.run)}, ${age.h.toFixed(1)} h old${age.ok ? '' : ` (more than ${BK_MAX_AGE_H} h: the update may be stuck)`}</p>` : '<p class="small warn">No HARMONIE data yet.</p>';
+  h += `<p class="small muted">Green = less than ${BK_DRY} mm/h everywhere on the way (±2.5 km), amber = under ${BK_LIGHT} mm/h, red = more.</p>`;
+  $('bkStatus').innerHTML = h;
+  $('bkHome').textContent = BK.picking === 'home' ? 'Tap the map…' : BK.home ? '🏠 Move home' : '🏠 Set home';
+  $('bkWork').textContent = BK.picking === 'work' ? 'Tap the map…' : BK.work ? '🏢 Move work' : '🏢 Set work';
+  $('bkPush').textContent = pushed ? '🔔 Show the setup code again' : '🔔 Turn on phone alerts';
+}
+function drawBikeMap() {
+  bkLayer.clearLayers();
+  if (BK.home && BK.work) L.polyline([BK.home, BK.work], { color: '#a78bfa', weight: 2, dashArray: '4 6', interactive: false }).addTo(bkLayer);
+  for (const [k, ic] of [['home', '🏠'], ['work', '🏢']]) {
+    if (BK[k]) L.marker(BK[k], { interactive: false, keyboard: false, icon: L.divIcon({ className: 'bk-pin-icon', html: `<div class="bk-pin">${ic}</div>`, iconSize: [24, 24] }) }).addTo(bkLayer);
+  }
+}
+function bikeSettingsChanged() { saveBike(); drawBikeMap(); renderBike(); if (store.get('kf.bikePush', false)) $('bkSetup').classList.add('hidden'); }
+function pickBike(k) { BK.picking = BK.picking === k ? null : k; $('map').classList.toggle('rt-drawing', !!BK.picking); renderBikePanel(); }
+function openBike() {
+  $('spots').classList.add('hidden'); if (!$('route').classList.contains('hidden')) closePanel('route'); setLayersOpen(false);
+  $('bkAm0').value = BK.am[0]; $('bkAm1').value = BK.am[1]; $('bkPm0').value = BK.pm[0]; $('bkPm1').value = BK.pm[1];
+  $('bike').classList.remove('hidden'); renderBikePanel(); renderBike();
+}
+$('bikePill').addEventListener('click', () => ($('bike').classList.contains('hidden') ? openBike() : closePanel('bike')));
+$('bkHome').addEventListener('click', () => pickBike('home'));
+$('bkWork').addEventListener('click', () => pickBike('work'));
+for (const [id, k, i] of [['bkAm0', 'am', 0], ['bkAm1', 'am', 1], ['bkPm0', 'pm', 0], ['bkPm1', 'pm', 1]]) {
+  $(id).addEventListener('change', (e) => { if (/^\d\d:\d\d$/.test(e.target.value)) { BK[k][i] = e.target.value; bikeSettingsChanged(); } });
+}
+// ---- phone alerts (Web Push). The GitHub job sends them; it needs this phone's subscription plus home/work as one secret.
+const b64uToBytes = (s) => { const b = atob(s.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((s.length + 3) % 4)); return Uint8Array.from(b, (c) => c.charCodeAt(0)); };
+const standalone = () => window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+function bkMsg(html) { $('bkSetup').classList.remove('hidden'); $('bkSetup').innerHTML = html; }
+$('bkPush').addEventListener('click', async () => {
+  if (!BK.home || !BK.work) return bkMsg('<p class="small warn">Set your home and work first.</p>');
+  const ios = /iPhone|iPad/.test(navigator.userAgent);
+  if (!('serviceWorker' in navigator) || !('PushManager' in window) || (ios && !standalone())) {
+    return bkMsg(`<p class="small">${ios ? 'On iPhone, alerts only work from the home-screen app: in Safari tap <b>Share → Add to Home Screen</b>, open the site from that icon, and tap this button again (iOS 16.4 or newer).' : 'This browser cannot receive web push alerts.'}</p>`);
+  }
+  try {
+    const reg = await navigator.serviceWorker.register('sw.js');
+    await navigator.serviceWorker.ready;
+    if ((await Notification.requestPermission()) !== 'granted') return bkMsg('<p class="small warn">Notifications are blocked. Allow them for this app in the iPhone Settings → Notifications.</p>');
+    const sub = (await reg.pushManager.getSubscription()) || (await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(VAPID_PUBLIC) }));
+    store.set('kf.bikePush', true);
+    const code = JSON.stringify({ sub: sub.toJSON(), home: BK.home, work: BK.work, am: BK.am, pm: BK.pm });
+    bkMsg(`<p class="small"><b>Last step:</b> give GitHub this code as a secret, so the daily check can reach this phone. It contains your home and work, so it goes in a secret, never in a file.</p>
+      <ol class="small"><li>Tap <b>Copy code</b>.</li><li>Open <a href="https://github.com/${REPO.owner}/${REPO.repo}/settings/secrets/actions/new" target="_blank" rel="noopener">the new-secret page on GitHub</a>.</li>
+      <li>Name: <code>BIKE_ALERT</code>, paste the code as the secret, tap <b>Add secret</b>. (If it already exists, open it and choose Update.)</li></ol>
+      <textarea id="bkCode" rows="3" readonly>${esc(code)}</textarea>
+      <div class="btns-row"><button class="btn small" id="bkCopy">Copy code</button><button class="btn small ghost" id="bkTest">Send a test alert</button></div>
+      <p class="small muted">Changed home, work or times later? Tap the alert button again and update the secret.</p>`);
+    $('bkCopy').onclick = async () => { try { await navigator.clipboard.writeText(code); $('bkCopy').textContent = 'Copied ✓'; } catch { $('bkCode').select(); } };
+    $('bkTest').onclick = sendBikeTest;
+    renderBikePanel();
+  } catch (e) { bkMsg(`<p class="small warn">Could not turn on alerts: ${esc(e.message)}</p>`); }
+});
+async function sendBikeTest() {
+  const tok = store.get('kf.ghToken', '');
+  if (!tok) return bkMsg(`<p class="small">A test needs the GitHub token of the ⟳ Update button (set it there first), or start it on GitHub: <a href="${ACTIONS_URL}" target="_blank" rel="noopener">the update job</a> → Run workflow → tick “Send a test bike alert”.</p>`);
+  const r = await gh(`/actions/workflows/${WORKFLOW}/dispatches`, tok, { method: 'POST', body: JSON.stringify({ ref: 'main', inputs: { bike_test: true } }) });
+  bkMsg(r.ok ? '<p class="small">✓ Test started. The alert arrives in about 5 minutes, after the data update.</p>' : `<p class="small warn">GitHub answered HTTP ${r.status}. Check the token.</p>`);
+}
+drawBikeMap();
+setInterval(renderBike, 600000);
+if (location.hash === '#bike') setTimeout(openBike, 0);
+
 // ------------------------------------------------------------------ legend
 function drawLegend() {
   const L = curLayer(), c = $('legendCanvas'), ctx = c.getContext('2d');
@@ -1402,7 +1565,7 @@ $('btnUpdate').addEventListener('click', () => {
   if (tok) return dispatchUpdate(tok);
   dialog(`<h3>Update the forecast now</h3>
     <p>New data is fetched by a GitHub job. Two ways to start it:</p>
-    <p><b>1. On GitHub</b> (works anywhere): open <a href="${ACTIONS_URL}" target="_blank" rel="noopener">the update job</a>, tap <i>Run workflow</i>, then <i>Run workflow</i> again. New data appears here after about 10–15 minutes.</p>
+    <p><b>1. On GitHub</b> (works anywhere): open <a href="${ACTIONS_URL}" target="_blank" rel="noopener">the update job</a>, tap <i>Run workflow</i>, then <i>Run workflow</i> again. New data appears here after about 2–5 minutes.</p>
     <p><b>2. One tap from this page:</b> paste a GitHub fine-grained token with access to only the <code>${esc(REPO.repo)}</code> repository and the permission <i>Actions: Read and write</i>. It is stored only in this browser.</p>
     <p class="small muted">Make one at <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com/settings/personal-access-tokens/new</a>: <i>Repository access</i> → <i>Only select repositories</i> → <code>${esc(REPO.repo)}</code>; <i>Permissions</i> → <i>Actions</i> → <i>Read and write</i>; then <i>Generate token</i> and copy it.</p>
     <input type="password" id="tokIn" placeholder="github_pat_…" autocomplete="off">
@@ -1433,7 +1596,7 @@ async function dispatchUpdate(tok) {
     if (!r.ok) throw new Error(`GitHub answered HTTP ${r.status}`);
   } catch (e) { show(`Could not start the job: ${esc(e.message)}`, false); return; }
   // follow the run, then wait for the new data file
-  for (let k = 0; k < 150; k++) {
+  for (let k = 0; k < 90; k++) {
     await new Promise((res) => setTimeout(res, 10000));
     let state = 'waiting for GitHub';
     try {
@@ -1446,7 +1609,7 @@ async function dispatchUpdate(tok) {
     } catch { /* keep polling */ }
     const fresh = await fetchData();
     if (fresh && fresh.generated !== before) { applyData(fresh); show('Done: new data loaded.', false); setTimeout(closeDialog, 1500); return; }
-    show(`${state} · ${Math.round((Date.now() - started) / 1000)} s. This usually takes 10–15 minutes; you can close this, the page keeps checking.`);
+    show(`${state} · ${Math.round((Date.now() - started) / 1000)} s. This usually takes 2–5 minutes (waves and current are refreshed once a day; HARMONIE every time there is a newer run). You can close this; the page keeps checking.`);
   }
   show('This is taking longer than expected. The page will pick up the new data on its own once it is published.', false);
 }
@@ -1514,6 +1677,7 @@ async function applyData(D) {
   checkAlert();
   loadWadden();
   RT.cache = null; drawRouteMap(); scheduleCompute();
+  renderBike();
 }
 async function boot() {
   for (const k of Object.keys(OVERLAYS)) if (S.ly[k]) setOverlay(k, true);
